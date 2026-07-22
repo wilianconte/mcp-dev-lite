@@ -1,0 +1,11 @@
+# Gerado/ajustado por scripts/provision-cloudflare.sh.
+# Coloque em ~/.cloudflared/config.yml (ou /etc/cloudflared/config.yml para serviço de sistema).
+tunnel: __TUNNEL_ID__
+credentials-file: __CREDENTIALS_FILE__
+
+ingress:
+  # Encaminha o hostname público para o servidor MCP local (somente 127.0.0.1).
+  - hostname: __HOSTNAME__
+    service: http://127.0.0.1:3000
+  # Regra catch-all obrigatória.
+  - service: http_status:404

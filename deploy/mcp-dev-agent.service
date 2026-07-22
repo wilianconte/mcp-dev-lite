@@ -1,0 +1,26 @@
+# Serviço systemd para o servidor MCP.
+# Instale em /etc/systemd/system/mcp-dev-agent.service e ajuste User/WorkingDirectory/EnvironmentFile.
+[Unit]
+Description=MCP dev-agent (Streamable HTTP)
+After=network.target
+
+[Service]
+Type=simple
+# Rode como usuario de baixo privilegio dedicado, NAO root.
+User=__RUN_USER__
+WorkingDirectory=__REPO_DIR__
+# EnvironmentFile deve conter MCP_AUTH_TOKEN=... e PORT=3000 (chmod 600).
+EnvironmentFile=__REPO_DIR__/.env
+# PATH explicito: garante que o servidor E os comandos rodados via run_command
+# usem o mesmo toolchain (node/npm v22) que o usuario usa no shell, nao o node do sistema.
+Environment=PATH=__NODE_BIN__:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=__NODE_BIN__/node __REPO_DIR__/dist/server.js
+# always: reinicia mesmo em saida "limpa" (ex.: SIGTERM externo), nao so em falha.
+# systemctl stop continua funcionando normalmente (stop explicito nunca dispara restart).
+Restart=always
+RestartSec=5
+# Escuta so em loopback; o cloudflared faz a ponte para a internet.
+Environment=HOST=127.0.0.1
+
+[Install]
+WantedBy=multi-user.target

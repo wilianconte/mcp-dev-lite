@@ -1,6 +1,6 @@
 # Deploy do mcp-dev-agent via Cloudflare Tunnel
 
-Expõe o servidor MCP com HTTPS público e estável, sem abrir portas na VM. `cloudflared` já está instalado nesta VM (`cloudflared version 2026.7.1`).
+Expõe o servidor MCP com HTTPS público e estável, sem abrir portas na VM.
 
 ## Visão geral
 
@@ -9,6 +9,24 @@ Copilot Studio ──HTTPS──► borda Cloudflare ──túnel de saída─�
 ```
 
 O `cloudflared` abre uma conexão **de saída** para a Cloudflare; nenhuma porta de entrada é aberta na VM.
+
+## Passo 0 — Garantir o `cloudflared`
+
+Verifique se já existe na máquina:
+
+```bash
+cloudflared --version
+```
+
+Se o comando não for encontrado, instale. Sem `sudo` (binário no diretório do usuário):
+
+```bash
+mkdir -p ~/.local/bin && curl -fsSL -o ~/.local/bin/cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 && chmod +x ~/.local/bin/cloudflared
+```
+
+`~/.local/bin` entra no `PATH` no próximo login (via `~/.profile`); na sessão atual, use o caminho completo ou `export PATH="$HOME/.local/bin:$PATH"`. Para outras arquiteturas, troque `linux-amd64` (ex.: `linux-arm64`) — ou use o pacote `.deb`/repositório oficial da Cloudflare se preferir instalação de sistema.
+
+O mesmo vale para o **Node.js** (`node --version`, requer >= 20): se não houver, instale antes de `npm ci`.
 
 ## Passo 1 — Login (você precisa fazer, uma vez)
 

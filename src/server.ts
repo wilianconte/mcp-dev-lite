@@ -12,6 +12,7 @@ import {
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { tools } from "./tools.js";
 import { DevAgentOAuthProvider } from "./oauth.js";
+import { auditToolCall } from "./audit.js";
 
 const PORT = Number(process.env.PORT ?? 3000);
 const HOST = process.env.HOST ?? "0.0.0.0";
@@ -29,18 +30,26 @@ if (!AUTH_TOKEN) {
 
 // Senha exigida na tela de aprovacao OAuth (fallback: o proprio MCP_AUTH_TOKEN).
 const APPROVAL_PASSWORD = process.env.OAUTH_APPROVAL_PASSWORD ?? AUTH_TOKEN;
-const DATA_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "data");
+const DATA_DIR = process.env.MCP_DATA_DIR
+  ? path.resolve(process.env.MCP_DATA_DIR)
+  : path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "data");
 const oauthProvider = new DevAgentOAuthProvider(DATA_DIR, APPROVAL_PASSWORD);
 const mcpUrl = new URL("/mcp", PUBLIC_URL);
 
+interface AuditRequestContext {
+  remoteIp?: string;
+  clientId?: string;
+}
+
 /** Cria uma instancia do servidor MCP com todas as ferramentas registradas. */
-function buildServer(): McpServer {
+function buildServer(context: AuditRequestContext = {}): McpServer {
   const server = new McpServer(
-    { name: "mcp-dev-agent", version: "1.0.0" },
+    { name: "mcp-dev-agent", version: "1.2.0" },
     {
       instructions:
-        "Servidor de desenvolvimento: executa comandos e manipula arquivos na VM. " +
-        "O agente decide quais comandos rodar para desenvolver e alterar as aplicacoes.",
+        "Servidor de desenvolvimento: executa comandos, manipula arquivos e entrega artefatos visuais da VM. " +
+        "Saidas grandes de comandos podem ser paginadas com read_command_output e screenshots devem ser lidas com read_image. " +
+        "O agente decide quais comandos rodar para desenvolver, analisar e alterar as aplicacoes.",
     },
   );
 
@@ -48,13 +57,25 @@ function buildServer(): McpServer {
     server.registerTool(
       tool.name,
       { title: tool.title, description: tool.description, inputSchema: tool.schema },
-      async (args: Record<string, unknown>) => {
+      async (args: Record<string, unknown>, extra) => {
+        const startedAtMs = Date.now();
+        const auditBase = {
+          tool: tool.name,
+          args,
+          sessionId: extra.sessionId,
+          requestId: extra.requestId,
+          clientId: context.clientId ?? extra.authInfo?.clientId,
+          remoteIp: context.remoteIp,
+          startedAtMs,
+        };
         try {
-          const text = await tool.handler(args);
-          return { content: [{ type: "text", text }] };
+          const result = await tool.handler(args);
+          await auditToolCall({ ...auditBase, result });
+          return result;
         } catch (err) {
+          await auditToolCall({ ...auditBase, error: err });
           const message = err instanceof Error ? err.message : String(err);
-          return { content: [{ type: "text", text: `ERRO: ${message}` }], isError: true };
+          return { content: [{ type: "text" as const, text: `ERRO: ${message}` }], isError: true };
         }
       },
     );
@@ -64,6 +85,15 @@ function buildServer(): McpServer {
 }
 
 const app = express();
+
+// Por padrao, confia apenas em proxies locais (ex.: cloudflared em 127.0.0.1).
+// Isso permite que req.ip reflita X-Forwarded-For sem aceitar spoofing de clientes remotos diretos.
+const trustProxyRaw = (process.env.MCP_TRUST_PROXY ?? "loopback").trim();
+if (trustProxyRaw.toLowerCase() === "false") app.set("trust proxy", false);
+else if (trustProxyRaw.toLowerCase() === "true") app.set("trust proxy", true);
+else if (/^\d+$/.test(trustProxyRaw)) app.set("trust proxy", Number(trustProxyRaw));
+else app.set("trust proxy", trustProxyRaw);
+
 app.use(express.json({ limit: "50mb" }));
 
 // Endpoints OAuth (para o ChatGPT e outros clientes MCP que exigem OAuth):
@@ -104,15 +134,20 @@ function mask(t: string): string {
  * - o token estatico MCP_AUTH_TOKEN (Copilot Studio);
  * - um access token OAuth emitido por este servidor (ChatGPT).
  */
-async function checkAuth(req: Request, res: Response): Promise<boolean> {
+interface AuthContext {
+  type: "static" | "oauth";
+  clientId: string;
+}
+
+async function checkAuth(req: Request, res: Response): Promise<AuthContext | null> {
   const rawHeader = (req.headers.authorization as string | undefined) ?? "";
   const token = extractToken(rawHeader);
 
-  if (token === AUTH_TOKEN) return true;
+  if (token === AUTH_TOKEN) return { type: "static", clientId: "static-token" };
   if (token) {
     try {
-      await oauthProvider.verifyAccessToken(token);
-      return true;
+      const info = await oauthProvider.verifyAccessToken(token);
+      return { type: "oauth", clientId: info.clientId };
     } catch {
       // Nao e um access token OAuth valido; cai no 401 abaixo.
     }
@@ -133,14 +168,15 @@ async function checkAuth(req: Request, res: Response): Promise<boolean> {
     error: { code: -32001, message: "Nao autorizado: Bearer token invalido ou ausente." },
     id: null,
   });
-  return false;
+  return null;
 }
 
 // Sessoes ativas, indexadas pelo header Mcp-Session-Id.
 const transports = new Map<string, StreamableHTTPServerTransport>();
 
 app.post("/mcp", async (req: Request, res: Response) => {
-  if (!(await checkAuth(req, res))) return;
+  const auth = await checkAuth(req, res);
+  if (!auth) return;
 
   const sessionId = req.headers["mcp-session-id"] as string | undefined;
   let transport = sessionId ? transports.get(sessionId) : undefined;
@@ -156,7 +192,7 @@ app.post("/mcp", async (req: Request, res: Response) => {
     transport.onclose = () => {
       if (transport!.sessionId) transports.delete(transport!.sessionId);
     };
-    await buildServer().connect(transport);
+    await buildServer({ remoteIp: req.ip, clientId: auth.clientId }).connect(transport);
   } else if (!transport) {
     res.status(400).json({
       jsonrpc: "2.0",
@@ -171,7 +207,8 @@ app.post("/mcp", async (req: Request, res: Response) => {
 
 // GET/DELETE para o canal de eventos SSE e encerramento de sessao.
 async function handleSession(req: Request, res: Response) {
-  if (!(await checkAuth(req, res))) return;
+  const auth = await checkAuth(req, res);
+  if (!auth) return;
   const sessionId = req.headers["mcp-session-id"] as string | undefined;
   const transport = sessionId ? transports.get(sessionId) : undefined;
   if (!transport) {

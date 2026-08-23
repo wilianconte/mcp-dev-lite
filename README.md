@@ -1,12 +1,19 @@
 # mcp-dev-agent
 
-Servidor **MCP (Model Context Protocol)** via **Streamable HTTP** que dá a um agente de IA — consumido por um agente do **Microsoft Copilot Studio** — as mesmas capacidades de desenvolvimento que um agente Claude Code tem nesta VM: executar comandos, editar/mover/listar arquivos e usar `node`, `npm`, `gh`, `git`, etc. **O agente decide quais comandos rodar.**
+Servidor **MCP (Model Context Protocol)** via **Streamable HTTP** que dá a um agente de IA capacidades de desenvolvimento na VM: executar comandos, editar/mover/listar arquivos, usar `node`, `npm`, `gh`, `git` e transportar screenshots como conteúdo visual MCP nativo. **O agente decide quais comandos rodar.**
 
 ## Documentação
 
-- [`docs/RECOMENDACAO.md`](docs/RECOMENDACAO.md) — recomendações de arquitetura e próximos passos antes de produção.
-- [`docs/DEPLOY-CLOUDFLARE.md`](docs/DEPLOY-CLOUDFLARE.md) — expor via Cloudflare Tunnel (HTTPS público, sem abrir portas).
-- `docs/CREDENCIAIS.local.md` — **secreto, fora do versionamento** (`.gitignore`): URL, token e dados do túnel em produção (`mcp.criaelo.com`).
+A documentação completa está organizada em [`docs/README.md`](docs/README.md).
+
+- [`docs/ARQUITETURA.md`](docs/ARQUITETURA.md) — componentes, autenticação, sessões, persistência e fluxos.
+- [`docs/FERRAMENTAS.md`](docs/FERRAMENTAS.md) — contrato das 10 ferramentas MCP e padrões de uso.
+- [`docs/OPERACAO.md`](docs/OPERACAO.md) — runbook, variáveis de ambiente e diagnóstico.
+- [`docs/SEGURANCA.md`](docs/SEGURANCA.md) — fronteiras de confiança, riscos e hardening.
+- [`docs/DESENVOLVIMENTO.md`](docs/DESENVOLVIMENTO.md) — estrutura do código, testes e workflow de alteração.
+- [`docs/AVALIACAO-TECNICA.md`](docs/AVALIACAO-TECNICA.md) — avaliação do estado atual e prioridades.
+- [`docs/DEPLOY-CLOUDFLARE.md`](docs/DEPLOY-CLOUDFLARE.md) — exposição via Cloudflare Tunnel.
+- `docs/CREDENCIAIS.local.md` — **secreto, fora do versionamento** (`.gitignore`): dados locais de produção, quando existir.
 
 ## Arquitetura
 
@@ -27,22 +34,39 @@ mcp-dev-agent  (Express + Streamable HTTP, porta 3000)
 - **Auth (duas formas, ambas aceitas no `/mcp`):**
   - **Bearer token estático** via header `Authorization` (variável `MCP_AUTH_TOKEN`) — usado pelo Copilot Studio.
   - **OAuth 2.1** conforme a spec de autorização do MCP (Dynamic Client Registration, authorization code + PKCE, refresh token) — exigido pelo ChatGPT. Endpoints: `/.well-known/oauth-authorization-server`, `/.well-known/oauth-protected-resource/mcp`, `/authorize`, `/token`, `/register`, `/revoke`. A aprovação pede a senha `OAUTH_APPROVAL_PASSWORD` (fallback: `MCP_AUTH_TOKEN`). Clients e tokens ficam em `data/oauth-state.json` (fora do versionamento, `chmod 600`); implementação em `src/oauth.ts`.
-- **Escopo de arquivos:** sem restrição de path — o agente opera em qualquer caminho da VM (decisão de projeto). Resolve `~` e caminhos relativos.
+- **Escopo de arquivos:** sem restrição de path — o agente opera em qualquer caminho permitido ao usuário Linux do serviço (decisão de projeto). Resolve `~` e caminhos relativos.
+- **Auditoria:** cada execução de ferramenta (`tools/call` validado) gera evento JSON estruturado com sessão/client, duração, argumentos sanitizados e resumo do resultado. O padrão é `stderr`/journald; `MCP_AUDIT_LOG_PATH` habilita JSONL em arquivo.
+- **Proxy:** `trust proxy=loopback` por padrão, adequado ao `cloudflared` local; outras topologias podem ajustar `MCP_TRUST_PROXY`.
 
 ## Ferramentas expostas
 
 | Ferramenta | O que faz |
 |---|---|
-| `run_command` | Executa qualquer comando de shell (bash) com `cwd` e `timeout` opcionais. Cobre `node`, `npm`, `npx`, `gh`, `git`, build, testes. Retorna stdout/stderr/exit code. |
-| `read_file` | Lê um arquivo (opcionalmente uma faixa de linhas). |
+| `run_command` | Executa shell (bash) com `cwd`/`timeout`. Saídas grandes não são mais descartadas: a prévia mostra início + fim e a saída completa recebe um `artifact_id`. |
+| `read_command_output` | Lê, por `offset`/`limit`, qualquer trecho de uma saída grande preservada por `run_command`. |
+| `read_file` | Lê texto por linhas ou por caracteres, retornando metadata, `has_more` e o próximo offset. O modo por caracteres cobre arquivos minificados/linhas enormes. |
+| `read_image` | Lê PNG/JPEG/GIF/WebP e retorna **ImageContent MCP nativo** + path, MIME, bytes, dimensões quando detectáveis e SHA-256. |
 | `write_file` | Cria ou sobrescreve um arquivo (cria diretórios pais). |
 | `edit_file` | Substituição de texto exato (`old_string` → `new_string`, com `replace_all`). |
-| `list_directory` | Lista entradas de um diretório com o tipo de cada uma. |
+| `list_directory` | Lista entradas com paginação (`offset`, `limit`, `has_more`, `next_offset`). |
 | `move_file` | Move ou renomeia arquivo/diretório. |
 | `make_directory` | `mkdir -p`. |
 | `delete_path` | Exclui arquivo ou diretório (`recursive` para diretórios). |
 
-`run_command` sozinho já cobre tudo; as ferramentas de arquivo existem porque são mais confiáveis e legíveis para o agente do que montar comandos de shell.
+`run_command` continua cobrindo o fluxo geral; as ferramentas específicas tornam leitura, paginação e transporte de artefatos mais confiáveis para o agente.
+
+### Saídas grandes e screenshots
+
+O servidor não força mais todo resultado de tool a virar uma única string. O contrato interno aceita um `CallToolResult` MCP completo, permitindo conteúdo multimodal.
+
+- Respostas textuais continuam limitando a **prévia** a aproximadamente 30 mil caracteres para proteger o contexto, mas o conteúdo completo de `run_command` é preservado temporariamente por até 1 hora (máximo de 50 artefatos no armazenamento temporário) e pode ser recuperado com `read_command_output`.
+- Quando uma prévia de comando precisa ser reduzida, ela preserva **início e fim** em vez de apenas cortar o final.
+- `read_file` informa tamanho total e próximo offset; arquivos minificados podem ser navegados com `char_offset`/`char_limit`.
+- `read_image` envia os bytes como bloco `type: "image"`; não passe imagens via `base64` em `run_command`, porque isso desperdiça contexto e perde a semântica multimodal.
+- O limite padrão para uma imagem é 10 MiB e pode ser ajustado com `MCP_MAX_IMAGE_BYTES`.
+- `run_command` usa grupo de processo próprio: em timeout, shell e descendentes são encerrados juntos. O buffer de segurança padrão foi elevado para 50 MiB e pode ser configurado com `MCP_COMMAND_MAX_BUFFER_BYTES`; se esse limite for atingido, o resultado informa explicitamente `output_limit_exceeded: true`.
+
+Para auditoria de UX, o fluxo recomendado é: gerar screenshots no projeto (por exemplo com Playwright) → localizar o arquivo → chamar `read_image` → analisar a imagem diretamente no modelo.
 
 ## Rodando
 
@@ -59,7 +83,7 @@ export OAUTH_APPROVAL_PASSWORD=uma-senha-forte
 npm start
 ```
 
-Desenvolvimento com reload: `npm run dev` (também precisa de `MCP_AUTH_TOKEN`).
+Desenvolvimento com reload: `npm run dev` (também precisa de `MCP_AUTH_TOKEN`). Testes locais: `npm test`.
 
 Health check (sem auth): `GET /health` → `{ "status": "ok", "tools": [...] }`.
 
@@ -93,7 +117,7 @@ O Copilot Studio consome MCP através de uma **tool/custom connector** apontando
 2. **Server URL:** a URL HTTPS pública que aponta para `/mcp` (ex.: `https://seu-host/mcp`).
 3. **Autenticação:** tipo **API Key** / cabeçalho, com header `Authorization` e valor `Bearer <seu MCP_AUTH_TOKEN>`. Guarde o token no cofre/variável de ambiente do connector, nunca no prompt.
 4. Salve e **publique** o connector; adicione a tool ao agente.
-5. As 8 ferramentas aparecem para o agente, que passa a decidir sozinho quando chamar `run_command`, `edit_file`, etc.
+5. As 10 ferramentas aparecem para o agente, que passa a decidir sozinho quando chamar `run_command`, `edit_file`, etc.
 
 > Observação: o suporte a MCP no Copilot Studio evolui rápido. Se a UI não oferecer MCP nativo na sua região/licença, crie um **custom connector** com uma spec OpenAPI que descreva o endpoint `/mcp` (Streamable HTTP) e o header `Authorization`.
 
@@ -112,8 +136,8 @@ Para revogar o acesso do ChatGPT: apague `data/oauth-state.json` e reinicie o se
 
 Este servidor **executa comandos arbitrários** na VM. Consequências:
 
-- Trate o `MCP_AUTH_TOKEN` como credencial de acesso root à VM. Rotacione-o periodicamente.
+- Trate o `MCP_AUTH_TOKEN` como credencial equivalente às permissões do usuário Linux que executa o serviço. Rotacione-o periodicamente.
 - Rode o processo com um **usuário de baixo privilégio** dedicado ao desenvolvimento, não como `root`.
 - Prefira uma **VM descartável/isolada** por projeto; não aponte para máquinas com dados sensíveis de outros sistemas.
 - Sempre atrás de **TLS**; nunca exponha a porta HTTP crua na internet.
-- Considere logs de auditoria dos comandos recebidos se precisar de rastreabilidade.
+- A auditoria de `tools/call` já é habilitada por padrão em `stderr`/journald; defina retenção adequada e use `MCP_AUDIT_LOG_PATH` apenas quando precisar de JSONL em arquivo.

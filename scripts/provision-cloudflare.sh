@@ -22,6 +22,16 @@ if [[ -z "$HOSTNAME" ]]; then
   exit 1
 fi
 
+if ! command -v cloudflared >/dev/null 2>&1; then
+  echo "ERRO: 'cloudflared' nao encontrado no PATH." >&2
+  echo "Instale (sem sudo, binario no diretorio do usuario):" >&2
+  echo "  mkdir -p ~/.local/bin && curl -fsSL -o ~/.local/bin/cloudflared \\" >&2
+  echo "    https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \\" >&2
+  echo "    && chmod +x ~/.local/bin/cloudflared" >&2
+  echo "Depois garanta o PATH:  export PATH=\"\$HOME/.local/bin:\$PATH\"" >&2
+  exit 1
+fi
+
 if [[ ! -f "${CF_DIR}/cert.pem" ]]; then
   echo "ERRO: nao autenticado. Rode primeiro:  cloudflared tunnel login" >&2
   echo "(abre o browser e grava ${CF_DIR}/cert.pem)" >&2

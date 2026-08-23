@@ -1,6 +1,6 @@
 {
   "name": "mcp-dev-agent",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "description": "Servidor MCP (Streamable HTTP) que expoe a um agente de IA as mesmas capacidades de desenvolvimento de um agente Claude Code: executar comandos, editar/mover/listar arquivos, usar node/npm/gh.",
   "type": "module",
   "bin": {
@@ -10,10 +10,11 @@
     "build": "tsc",
     "start": "node dist/server.js",
     "dev": "tsx watch src/server.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "npm run build && node --test test/*.test.mjs"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.12.0",
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "express": "^4.21.2",
     "zod": "^3.24.1"
   },

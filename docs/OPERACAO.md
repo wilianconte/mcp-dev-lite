@@ -20,10 +20,13 @@ Este documento é o runbook do `mcp-dev-agent`.
 | `PUBLIC_URL` | Produção/OAuth | `http://localhost:<PORT>` | Issuer OAuth e base pública do resource server. |
 | `OAUTH_APPROVAL_PASSWORD` | Recomendado | `MCP_AUTH_TOKEN` | Senha da tela de aprovação OAuth. |
 | `MCP_MAX_IMAGE_BYTES` | Não | `10485760` | Tamanho máximo de imagem lida por `read_image`. |
+| `MCP_MAX_TEXT_FILE_BYTES` | Não | `10485760` | Tamanho máximo de arquivo de texto lido por `read_file` / `read_files`. |
 | `MCP_COMMAND_MAX_BUFFER_BYTES` | Não | `52428800` | Máximo combinado capturado de stdout/stderr por comando. |
 | `MCP_TRUST_PROXY` | Não | `loopback` | Proxies confiáveis pelo Express; `loopback` é o recomendado com cloudflared local. |
-| `MCP_AUDIT_LOG_PATH` | Não | — | Arquivo JSONL opcional para auditoria de `tools/call`. |
+| `MCP_AUDIT_LOG_PATH` | Não | `./data/audit.jsonl` | Arquivo JSONL para auditoria de `tools/call`. |
+| `MCP_AUDIT_MAX_BYTES` | Não | `20971520` | Limite em bytes antes de rotacionar `audit.jsonl` para `audit.jsonl.1` (padrão 20 MiB). |
 | `MCP_AUDIT_STDERR` | Não | `true` | Envia eventos estruturados também para stderr/journald. |
+| `MCP_LOG_PROTOCOL_EVENTS` | Não | `false` | Quando `true`, inclui handshakes de protocolo (`mcp.initialize`, `mcp.sse_open`, `mcp.tools_list`) na lista de transações em `/logs`. |
 | `MCP_DATA_DIR` | Não | `./data` relativo ao projeto | Sobrescreve o diretório de estado OAuth; útil em testes/isolamento. |
 
 Valores de tamanho são em bytes.
@@ -78,10 +81,16 @@ Exemplo esperado:
   "tools": [
     "run_command",
     "read_command_output",
+    "start_command",
+    "poll_command",
     "read_file",
+    "read_files",
+    "search_code",
+    "find_files",
     "read_image",
     "write_file",
     "edit_file",
+    "multi_edit_file",
     "list_directory",
     "move_file",
     "make_directory",
@@ -109,9 +118,13 @@ curl http://127.0.0.1:3000/health
 
 Por fim, faça um handshake MCP autenticado conforme o exemplo do README.
 
-## Logs
+## Logs e Painel em Tempo Real (`/logs`)
 
-A aplicação escreve em stdout/stderr:
+O servidor disponibiliza uma interface web em `/logs` (protegida por sessão de cookie autenticada com `OAUTH_APPROVAL_PASSWORD` ou `MCP_AUTH_TOKEN`, ou via `Authorization: Bearer`) com duas abas principais:
+- **Conexões**: sessões MCP ativas, cliente conectado, IP, contadores de chamadas/erros e atividade em andamento;
+- **Transações (Logs em Tempo Real)**: stream SSE (`/logs/stream`) e histórico (`/logs/api`) com filtros de busca, status, ferramenta, sessão e modal de detalhes completos da requisição/resposta.
+
+Além disso, a aplicação escreve em stdout/stderr:
 
 - inicialização e lista de ferramentas;
 - registro de clientes OAuth;
@@ -127,7 +140,7 @@ journalctl -u mcp-dev-agent -f
 journalctl -u mcp-dev-agent --since today
 ```
 
-Para persistir auditoria fora do journald, configure `MCP_AUDIT_LOG_PATH`, por exemplo `./data/audit.jsonl`. Os registros são JSON Lines e têm redaction de campos/padrões sensíveis. Em produção simples, prefira `journald` por já oferecer retenção e rotação.
+Para persistir auditoria fora do journald, configure `MCP_AUDIT_LOG_PATH` (padrão `./data/audit.jsonl`). Os registros são JSON Lines e têm redaction de campos/padrões sensíveis.
 
 ## Diagnóstico rápido
 

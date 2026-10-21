@@ -96,7 +96,7 @@ test('servidor integra auth, sessoes MCP, auditoria, proxy e OAuth PKCE', { time
   try {
     const health = await waitForHealth(baseUrl, child);
     assert.equal(health.status, 'ok');
-    assert.equal(health.tools.length, 10);
+    assert.equal(health.tools.length, 16);
 
     const unauthorized = await fetch(`${baseUrl}/mcp`, {
       method: 'POST',
@@ -121,7 +121,7 @@ test('servidor integra auth, sessoes MCP, auditoria, proxy e OAuth PKCE', { time
 
     const listed = await mcpPost(baseUrl, staticToken, { jsonrpc: '2.0', id: 3, method: 'tools/list', params: {} }, sessionId);
     assert.equal(listed.response.status, 200, listed.text);
-    assert.equal(listed.body?.result?.tools?.length, 10);
+    assert.equal(listed.body?.result?.tools?.length, 16);
 
     const called = await mcpPost(
       baseUrl,
@@ -248,6 +248,57 @@ test('servidor integra auth, sessoes MCP, auditoria, proxy e OAuth PKCE', { time
       { jsonrpc: '2.0', id: 6, method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'revoked-test', version: '1' } } },
     );
     assert.equal(revokedUse.response.status, 401, 'access token revogado nao pode acessar /mcp');
+
+    // Validacao do painel /logs (HTML), /logs/api (JSON) e /logs/stream (SSE em tempo real).
+    const logsHtmlRes = await fetch(`${baseUrl}/logs`, { headers: { accept: 'text/html' } });
+    assert.equal(logsHtmlRes.status, 200);
+    assert.match(logsHtmlRes.headers.get('content-type') ?? '', /text\/html/);
+    const logsHtml = await logsHtmlRes.text();
+    assert.match(logsHtml, /MCP Monitor — \/logs/);
+    assert.match(logsHtml, /EventSource\('\/logs\/stream'\)/);
+
+    const logsApiRes = await fetch(`${baseUrl}/logs/api`);
+    assert.equal(logsApiRes.status, 200);
+    const snapshot = await logsApiRes.json();
+    assert.equal(snapshot.server.name, 'mcp-dev-agent');
+    assert.equal(snapshot.stats.activeSessions, 2);
+    assert.ok(snapshot.stats.totalToolCalls >= 1);
+    assert.ok(snapshot.sessions.some((s) => s.sessionId === sessionId && s.clientName === 'integration-test'));
+    const txTool = snapshot.transactions.find((t) => t.event === 'mcp.tool_call' && t.tool === 'list_directory');
+    assert.ok(txTool, '/logs/api deve listar a transacao de list_directory');
+    assert.equal(txTool.status, 'ok');
+    assert.ok(txTool.result?.preview, 'transacao deve incluir preview sanitizado da saida');
+
+    // Testa stream SSE (/logs/stream) recebendo snapshot inicial + nova transacao em tempo real.
+    const sseAbort = new AbortController();
+    const sseResponse = await fetch(`${baseUrl}/logs/stream`, { signal: sseAbort.signal });
+    assert.equal(sseResponse.status, 200);
+    assert.match(sseResponse.headers.get('content-type') ?? '', /text\/event-stream/);
+    const reader = sseResponse.body.getReader();
+    const decoder = new TextDecoder();
+    let sseBuffer = '';
+
+    const readUntil = async (predicate) => {
+      for (let i = 0; i < 40; i += 1) {
+        if (predicate(sseBuffer)) return;
+        const { value, done } = await reader.read();
+        if (done) break;
+        sseBuffer += decoder.decode(value, { stream: true });
+      }
+      assert.ok(predicate(sseBuffer), `SSE nao recebeu evento esperado. Buffer:\n${sseBuffer.slice(0, 800)}`);
+    };
+
+    await readUntil((buf) => buf.includes('event: snapshot'));
+
+    await mcpPost(
+      baseUrl,
+      staticToken,
+      { jsonrpc: '2.0', id: 7, method: 'tools/call', params: { name: 'make_directory', arguments: { path: path.join(root, 'sse-dir') } } },
+      sessionId,
+    );
+
+    await readUntil((buf) => buf.includes('event: transaction') && buf.includes('"tool":"make_directory"') && buf.includes('"status":"ok"'));
+    sseAbort.abort();
   } finally {
     child.kill('SIGTERM');
     await new Promise((resolve) => {

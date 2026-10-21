@@ -1,6 +1,6 @@
 {
   "name": "mcp-dev-agent",
-  "version": "1.2.0",
+  "version": "1.4.0",
   "description": "Servidor MCP (Streamable HTTP) que expoe a um agente de IA as mesmas capacidades de desenvolvimento de um agente Claude Code: executar comandos, editar/mover/listar arquivos, usar node/npm/gh.",
   "type": "module",
   "bin": {

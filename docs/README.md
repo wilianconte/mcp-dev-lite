@@ -8,7 +8,7 @@ Este diretório concentra a documentação técnica e operacional do `mcp-dev-ag
 |---|---|
 | [`../README.md`](../README.md) | Visão rápida, instalação e conexão de clientes MCP. |
 | [`ARQUITETURA.md`](./ARQUITETURA.md) | Entender componentes, autenticação, sessões, persistência e fluxo das chamadas. |
-| [`FERRAMENTAS.md`](./FERRAMENTAS.md) | Consultar o contrato e as limitações das 10 ferramentas MCP. |
+| [`FERRAMENTAS.md`](./FERRAMENTAS.md) | Consultar o contrato, matriz de decisão e boas práticas das 16 ferramentas MCP. |
 | [`OPERACAO.md`](./OPERACAO.md) | Subir, validar, diagnosticar e manter o serviço. |
 | [`SEGURANCA.md`](./SEGURANCA.md) | Entender o modelo de ameaça, controles existentes e riscos aceitos. |
 | [`DESENVOLVIMENTO.md`](./DESENVOLVIMENTO.md) | Alterar o código, adicionar ferramentas e executar validações. |
@@ -22,7 +22,7 @@ Para evitar duplicação e divergência:
 
 - **README raiz:** onboarding e quick start.
 - **ARQUITETURA:** desenho do sistema e decisões estruturais.
-- **FERRAMENTAS:** contrato funcional exposto pelo MCP.
+- **FERRAMENTAS:** contrato funcional e guia de uso exposto pelo MCP.
 - **OPERACAO:** runbook do serviço.
 - **SEGURANCA:** riscos, controles e checklist de hardening.
 - **DESENVOLVIMENTO:** workflow de contribuição e testes.
@@ -32,6 +32,6 @@ Quando uma mudança de código alterar comportamento, atualize o documento propr
 
 ## Estado atual resumido
 
-A versão em desenvolvimento é `1.2.0` e expõe 10 ferramentas. O projeto usa Node.js 20+, TypeScript em modo estrito, Express, o SDK oficial do Model Context Protocol e transporte Streamable HTTP.
+A versão em desenvolvimento é `1.4.0` e expõe 16 ferramentas. O projeto usa Node.js 20+, TypeScript em modo estrito, Express, o SDK oficial do Model Context Protocol e transporte Streamable HTTP.
 
 O servidor aceita autenticação por token estático e OAuth 2.1, mantém sessões MCP em memória e permite execução arbitrária de shell e acesso irrestrito ao filesystem do usuário do processo. Essa autonomia é intencional e deve ser tratada como uma fronteira de segurança crítica.

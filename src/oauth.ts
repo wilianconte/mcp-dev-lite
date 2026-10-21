@@ -1,5 +1,5 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
-import { chmodSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import express, { type Request, type Response, Router } from "express";
 import type {
@@ -74,6 +74,9 @@ function escapeHtml(s: string): string {
     .replace(/"/g, "&quot;");
 }
 
+import { chmod, rename, writeFile } from "node:fs/promises";
+import type { McpMonitor } from "./monitor.js";
+
 /**
  * Servidor OAuth 2.1 self-hosted para o mcp-dev-agent, no formato que o
  * ChatGPT (e outros clientes MCP) esperam: Dynamic Client Registration,
@@ -89,13 +92,17 @@ export class DevAgentOAuthProvider implements OAuthServerProvider {
   private state: PersistedState = { clients: {}, accessTokens: {}, refreshTokens: {} };
   private readonly statePath: string;
   private readonly approvalPassword: string;
+  private readonly monitor?: McpMonitor;
   private readonly pending = new Map<string, PendingAuthorization>();
   private readonly codes = new Map<string, AuthorizationCode>();
   // Limite de tentativas de senha por IP: 10 falhas / 15 min.
   private readonly failedAttempts = new Map<string, { count: number; resetAt: number }>();
+  private saveChain: Promise<void> = Promise.resolve();
+  private saveScheduled = false;
 
-  constructor(dataDir: string, approvalPassword: string) {
+  constructor(dataDir: string, approvalPassword: string, monitor?: McpMonitor) {
     this.approvalPassword = approvalPassword;
+    this.monitor = monitor;
     this.statePath = path.join(dataDir, "oauth-state.json");
     mkdirSync(dataDir, { recursive: true });
     try {
@@ -106,34 +113,61 @@ export class DevAgentOAuthProvider implements OAuthServerProvider {
     this.pruneExpired();
   }
 
-  private save(): void {
-    const tmp = `${this.statePath}.tmp`;
-    writeFileSync(tmp, JSON.stringify(this.state, null, 2));
-    chmodSync(tmp, 0o600);
-    renameSync(tmp, this.statePath);
+  /** Agenda persistencia assincrona coalescida para nao bloquear o event loop em chamadas concorrentes. */
+  private save(): Promise<void> {
+    if (this.saveScheduled) return this.saveChain;
+    this.saveScheduled = true;
+    this.saveChain = this.saveChain
+      .then(async () => {
+        this.saveScheduled = false;
+        const payload = JSON.stringify(this.state);
+        const tmp = `${this.statePath}.tmp`;
+        await writeFile(tmp, payload, { encoding: "utf8", mode: 0o600 });
+        await chmod(tmp, 0o600).catch(() => undefined);
+        await rename(tmp, this.statePath);
+      })
+      .catch((err) => {
+        this.saveScheduled = false;
+        const message = err instanceof Error ? err.message : String(err);
+        console.error(`[oauth] falha ao persistir estado: ${message}`);
+      });
+    return this.saveChain;
   }
 
   private pruneExpired(): void {
     const now = nowSec();
+    let stateDirty = false;
     for (const map of [this.state.accessTokens, this.state.refreshTokens]) {
       for (const [token, info] of Object.entries(map)) {
-        if (info.expiresAt <= now) delete map[token];
+        if (info.expiresAt <= now) {
+          delete map[token];
+          stateDirty = true;
+        }
       }
     }
     for (const [id, p] of this.pending) if (p.expiresAt <= now) this.pending.delete(id);
     for (const [code, c] of this.codes) if (c.expiresAt <= now) this.codes.delete(code);
+    for (const [ip, att] of this.failedAttempts) if (att.resetAt <= now) this.failedAttempts.delete(ip);
+    if (stateDirty) void this.save();
   }
 
   get clientsStore(): OAuthRegisteredClientsStore {
     return {
       getClient: (clientId: string) => this.state.clients[clientId],
-      registerClient: (client: OAuthClientInformationFull) => {
+      registerClient: async (client: OAuthClientInformationFull) => {
         this.state.clients[client.client_id] = client;
-        this.save();
+        await this.save();
         console.log(
           `[oauth] client registrado: ${client.client_id} (${client.client_name ?? "sem nome"}) | ` +
             `redirect_uris: ${client.redirect_uris.join(", ")}`,
         );
+        this.monitor?.recordEvent({
+          category: "oauth",
+          event: "oauth.register",
+          clientId: client.client_id,
+          summary: `Client registrado: ${client.client_name ?? client.client_id}`,
+          args: { client_name: client.client_name, redirect_uris: client.redirect_uris },
+        });
         return client;
       },
     };
@@ -231,6 +265,14 @@ export class DevAgentOAuthProvider implements OAuthServerProvider {
           current.count += 1;
           this.failedAttempts.set(ip, current);
           console.warn(`[oauth] senha incorreta na aprovacao | ip ${ip} | tentativa ${current.count}`);
+          this.monitor?.recordEvent({
+            category: "oauth",
+            event: "oauth.approve_failed",
+            status: "error",
+            clientId: pending.client.client_id,
+            remoteIp: ip,
+            error: `Senha incorreta na aprovacao OAuth (tentativa ${current.count})`,
+          });
           res.status(401).type("html").send(this.approvalPage(pendingId, pending.client, "Senha incorreta."));
           return;
         }
@@ -249,6 +291,13 @@ export class DevAgentOAuthProvider implements OAuthServerProvider {
         redirect.searchParams.set("code", code);
         if (pending.params.state) redirect.searchParams.set("state", pending.params.state);
         console.log(`[oauth] autorizacao aprovada para client ${pending.client.client_id}`);
+        this.monitor?.recordEvent({
+          category: "oauth",
+          event: "oauth.approve",
+          clientId: pending.client.client_id,
+          remoteIp: ip,
+          summary: `Autorizacao aprovada para ${pending.client.client_name ?? pending.client.client_id}`,
+        });
         res.redirect(302, redirect.href);
       },
     );
@@ -280,7 +329,7 @@ export class DevAgentOAuthProvider implements OAuthServerProvider {
       throw new InvalidGrantError("redirect_uri diferente do usado na autorizacao.");
     }
     this.codes.delete(authorizationCode); // uso unico
-    return this.issueTokens(client.client_id, code.scopes);
+    return this.issueTokens(client.client_id, code.scopes, "authorization_code");
   }
 
   async exchangeRefreshToken(
@@ -295,16 +344,26 @@ export class DevAgentOAuthProvider implements OAuthServerProvider {
     }
     // Rotacao: o refresh token antigo deixa de valer.
     delete this.state.refreshTokens[refreshToken];
-    return this.issueTokens(client.client_id, scopes?.length ? scopes : stored.scopes);
+    return this.issueTokens(client.client_id, scopes?.length ? scopes : stored.scopes, "refresh_token");
   }
 
-  private issueTokens(clientId: string, scopes: string[]): OAuthTokens {
+  private async issueTokens(
+    clientId: string,
+    scopes: string[],
+    grantType: "authorization_code" | "refresh_token",
+  ): Promise<OAuthTokens> {
     const accessToken = newToken();
     const refreshToken = newToken();
     const now = nowSec();
     this.state.accessTokens[accessToken] = { clientId, scopes, expiresAt: now + ACCESS_TOKEN_TTL };
     this.state.refreshTokens[refreshToken] = { clientId, scopes, expiresAt: now + REFRESH_TOKEN_TTL };
-    this.save();
+    await this.save();
+    this.monitor?.recordEvent({
+      category: "oauth",
+      event: grantType === "refresh_token" ? "oauth.refresh" : "oauth.token",
+      clientId,
+      summary: `Tokens emitidos via ${grantType}`,
+    });
     return {
       access_token: accessToken,
       token_type: "bearer",
@@ -335,6 +394,12 @@ export class DevAgentOAuthProvider implements OAuthServerProvider {
     for (const map of [this.state.accessTokens, this.state.refreshTokens]) {
       if (map[token]?.clientId === client.client_id) delete map[token];
     }
-    this.save();
+    await this.save();
+    this.monitor?.recordEvent({
+      category: "oauth",
+      event: "oauth.revoke",
+      clientId: client.client_id,
+      summary: `Token revogado para ${client.client_id}`,
+    });
   }
 }

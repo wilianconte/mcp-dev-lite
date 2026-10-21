@@ -20,16 +20,19 @@ Cloudflare Tunnel / reverse proxy
 Express (src/server.ts)
   |-- endpoints OAuth
   |-- /mcp (Streamable HTTP)
+  |-- /logs, /logs/api, /logs/stream (src/monitor.ts)
   |-- /health
   |
   +--> DevAgentOAuthProvider (src/oauth.ts)
   |      |-- clients e tokens persistidos
   |      `-- aprovações e authorization codes em memória
   |
-  `--> McpServer
+  `--> McpServer (com instructions de decisão das ferramentas)
          `--> tools[] (src/tools.ts)
-                |-- shell / filesystem
-                |-- leitura de imagem
+                |-- shell síncrono (run_command) e assíncrono em background (start_command / poll_command)
+                |-- busca nativa com ripgrep (search_code, find_files)
+                |-- leitura/edição unitária e em lote (read_file, read_files, edit_file, multi_edit_file)
+                |-- leitura de imagem (read_image)
                 `-- armazenamento temporário de saídas grandes
                        `--> src/output-store.ts
 ```
@@ -44,7 +47,8 @@ Responsável por:
 - registro dos endpoints OAuth fornecidos pelo SDK MCP;
 - autenticação do endpoint `/mcp`;
 - criação e gerenciamento das sessões Streamable HTTP;
-- registro das ferramentas MCP;
+- registro das ferramentas MCP e instruções (`instructions`) de orientação ao modelo;
+- rotas de monitoramento em tempo real (`/logs`, `/logs/login`, `/logs/logout`, `/logs/api`, `/logs/stream`);
 - endpoint `/health`.
 
 Cada sessão MCP recebe uma instância de `McpServer`. Os transportes ativos são indexados pelo header `Mcp-Session-Id` em um `Map` em memória.
@@ -74,14 +78,18 @@ Estado somente em memória:
 
 ### `src/tools.ts`
 
-Define o catálogo de ferramentas e seus schemas Zod. Os handlers retornam `CallToolResult`, permitindo resultados textuais e multimodais.
+Define o catálogo de 16 ferramentas e seus schemas Zod. Os handlers retornam `CallToolResult`, permitindo resultados textuais e multimodais.
 
 Os grupos principais são:
 
-- execução de shell;
-- leitura e escrita de filesystem;
-- paginação de conteúdo;
-- leitura de screenshots como `ImageContent` MCP.
+- execução de shell síncrono (`run_command`, `read_command_output`) e assíncrono em background (`start_command`, `poll_command`);
+- busca nativa de código e de arquivos via `ripgrep` (`search_code`, `find_files`);
+- leitura e escrita de filesystem unitária e em lote (`read_file`, `read_files`, `write_file`, `edit_file`, `multi_edit_file`, `list_directory`, `move_file`, `make_directory`, `delete_path`);
+- leitura de screenshots como `ImageContent` MCP (`read_image`).
+
+### `src/monitor.ts`
+
+Mantém o rastreamento em tempo real das sessões MCP e das transações (`tools/call`), hidratando o histórico inicial a partir da cauda (últimos 2 MiB) do arquivo JSONL de auditoria (`data/audit.jsonl`) e transmitindo atualizações ao vivo via Server-Sent Events (`/logs/stream`) para o painel web em `/logs`. Handshakes efêmeros (`mcp.initialize`, `mcp.sse_open`, `mcp.tools_list`) atualizam as métricas de sessão sem poluir o buffer de 500 transações (a menos que `MCP_LOG_PROTOCOL_EVENTS=true`).
 
 ### `src/output-store.ts`
 

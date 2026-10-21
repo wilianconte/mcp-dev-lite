@@ -7,7 +7,7 @@ Servidor **MCP (Model Context Protocol)** via **Streamable HTTP** que dá a um a
 A documentação completa está organizada em [`docs/README.md`](docs/README.md).
 
 - [`docs/ARQUITETURA.md`](docs/ARQUITETURA.md) — componentes, autenticação, sessões, persistência e fluxos.
-- [`docs/FERRAMENTAS.md`](docs/FERRAMENTAS.md) — contrato das 10 ferramentas MCP e padrões de uso.
+- [`docs/FERRAMENTAS.md`](docs/FERRAMENTAS.md) — contrato das 16 ferramentas MCP, matriz de decisão e padrões de uso.
 - [`docs/OPERACAO.md`](docs/OPERACAO.md) — runbook, variáveis de ambiente e diagnóstico.
 - [`docs/SEGURANCA.md`](docs/SEGURANCA.md) — fronteiras de confiança, riscos e hardening.
 - [`docs/DESENVOLVIMENTO.md`](docs/DESENVOLVIMENTO.md) — estrutura do código, testes e workflow de alteração.
@@ -35,25 +35,31 @@ mcp-dev-agent  (Express + Streamable HTTP, porta 3000)
   - **Bearer token estático** via header `Authorization` (variável `MCP_AUTH_TOKEN`) — usado pelo Copilot Studio.
   - **OAuth 2.1** conforme a spec de autorização do MCP (Dynamic Client Registration, authorization code + PKCE, refresh token) — exigido pelo ChatGPT. Endpoints: `/.well-known/oauth-authorization-server`, `/.well-known/oauth-protected-resource/mcp`, `/authorize`, `/token`, `/register`, `/revoke`. A aprovação pede a senha `OAUTH_APPROVAL_PASSWORD` (fallback: `MCP_AUTH_TOKEN`). Clients e tokens ficam em `data/oauth-state.json` (fora do versionamento, `chmod 600`); implementação em `src/oauth.ts`.
 - **Escopo de arquivos:** sem restrição de path — o agente opera em qualquer caminho permitido ao usuário Linux do serviço (decisão de projeto). Resolve `~` e caminhos relativos.
-- **Auditoria:** cada execução de ferramenta (`tools/call` validado) gera evento JSON estruturado com sessão/client, duração, argumentos sanitizados e resumo do resultado. O padrão é `stderr`/journald; `MCP_AUDIT_LOG_PATH` habilita JSONL em arquivo.
+- **Auditoria e Monitoramento em Tempo Real (`/logs`):** cada execução de ferramenta (`tools/call` validado) gera evento JSON estruturado com sessão/client, duração, argumentos sanitizados e resumo do resultado. Além de `stderr`/journald e `MCP_AUDIT_LOG_PATH`, o painel `/logs` exibe conexões ativas e transações em tempo real via SSE (`/logs/stream`).
 - **Proxy:** `trust proxy=loopback` por padrão, adequado ao `cloudflared` local; outras topologias podem ajustar `MCP_TRUST_PROXY`.
 
-## Ferramentas expostas
+## Ferramentas expostas (16 ferramentas)
 
 | Ferramenta | O que faz |
 |---|---|
-| `run_command` | Executa shell (bash) com `cwd`/`timeout`. Saídas grandes não são mais descartadas: a prévia mostra início + fim e a saída completa recebe um `artifact_id`. |
-| `read_command_output` | Lê, por `offset`/`limit`, qualquer trecho de uma saída grande preservada por `run_command`. |
-| `read_file` | Lê texto por linhas ou por caracteres, retornando metadata, `has_more` e o próximo offset. O modo por caracteres cobre arquivos minificados/linhas enormes. |
-| `read_image` | Lê PNG/JPEG/GIF/WebP e retorna **ImageContent MCP nativo** + path, MIME, bytes, dimensões quando detectáveis e SHA-256. |
+| `find_files` | Localiza caminhos de arquivos rapidamente por substring ou glob (`rg --files`) sem ler o conteúdo interno, ignorando `node_modules`/`.git`/`.next`/`dist`/`build`/`coverage`. |
+| `search_code` | Busca código com `ripgrep` (`rg`) nativo sem subir bash, ignorando `node_modules`/`.git`/`.next`/`dist` por padrão e com fallback automático para texto literal se o regex for inválido. |
+| `read_file` | Lê texto por linhas ou por caracteres, com bloqueio automático de arquivos binários e limite de tamanho (`MCP_MAX_TEXT_FILE_BYTES`). |
+| `read_files` | Lê de 1 a 20 arquivos de texto em paralelo numa única chamada, reduzindo round-trips. |
+| `edit_file` | Substituição de texto exato (`old_string` → `new_string`, com `replace_all`) e diagnóstico contextual de linhas em caso de falha. |
+| `multi_edit_file` | Aplica múltiplas substituições exatas no mesmo arquivo de forma atômica (se uma falhar, nenhuma é gravada), com diagnóstico contextual. |
 | `write_file` | Cria ou sobrescreve um arquivo (cria diretórios pais). |
-| `edit_file` | Substituição de texto exato (`old_string` → `new_string`, com `replace_all`). |
-| `list_directory` | Lista entradas com paginação (`offset`, `limit`, `has_more`, `next_offset`). |
+| `run_command` | Executa shell síncrono (bash) com `cwd`/`timeout` para comandos rápidos (< 15-30s). Saídas grandes recebem prévia início + fim e `artifact_id`. |
+| `read_command_output` | Lê, por `offset`/`limit`, qualquer trecho de uma saída grande preservada por `run_command`, `start_command`, `search_code` ou `find_files`. |
+| `start_command` | Inicia comando longo em background (builds, testes E2E/Playwright, deploys, subagentes CLI) e retorna `job_id` sem risco de timeout HTTP/Cloudflare. |
+| `poll_command` | Consulta status, lê novas saídas incrementais (`offset=next_offset`) ou encerra (`kill=true`) um job iniciado por `start_command`. |
+| `read_image` | Lê PNG/JPEG/GIF/WebP e retorna **ImageContent MCP nativo** + path, MIME, bytes, dimensões quando detectáveis e SHA-256. |
+| `list_directory` | Lista entradas com paginação (`offset`, `limit`, `has_more`, `next_offset`) e profundidade recursiva opcional (`max_depth` de 1 a 4). |
 | `move_file` | Move ou renomeia arquivo/diretório. |
 | `make_directory` | `mkdir -p`. |
 | `delete_path` | Exclui arquivo ou diretório (`recursive` para diretórios). |
 
-`run_command` continua cobrindo o fluxo geral; as ferramentas específicas tornam leitura, paginação e transporte de artefatos mais confiáveis para o agente.
+`run_command` e `start_command` cobrem qualquer operação de shell; as ferramentas dedicadas (`find_files`, `search_code`, `read_files`, `multi_edit_file`, `read_image`) reduzem round-trips e tornam leitura, busca, edição e transporte de artefatos muito mais rápidos e confiáveis para o agente.
 
 ### Saídas grandes e screenshots
 
@@ -117,7 +123,7 @@ O Copilot Studio consome MCP através de uma **tool/custom connector** apontando
 2. **Server URL:** a URL HTTPS pública que aponta para `/mcp` (ex.: `https://seu-host/mcp`).
 3. **Autenticação:** tipo **API Key** / cabeçalho, com header `Authorization` e valor `Bearer <seu MCP_AUTH_TOKEN>`. Guarde o token no cofre/variável de ambiente do connector, nunca no prompt.
 4. Salve e **publique** o connector; adicione a tool ao agente.
-5. As 10 ferramentas aparecem para o agente, que passa a decidir sozinho quando chamar `run_command`, `edit_file`, etc.
+5. As 16 ferramentas aparecem para o agente, que passa a decidir sozinho quando chamar `find_files`, `search_code`, `read_files`, `multi_edit_file`, `run_command`, `start_command`, etc.
 
 > Observação: o suporte a MCP no Copilot Studio evolui rápido. Se a UI não oferecer MCP nativo na sua região/licença, crie um **custom connector** com uma spec OpenAPI que descreva o endpoint `/mcp` (Streamable HTTP) e o header `Authorization`.
 

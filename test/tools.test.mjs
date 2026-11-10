@@ -229,7 +229,8 @@ test('start_command e poll_command acompanham job em background, sugerem next_of
   });
   const startedText = textOf(started);
   assert.match(startedText, /status: running/);
-  assert.match(startedText, /poll_hint: passe offset=/);
+  assert.match(startedText, /process_alive: true/);
+  assert.match(startedText, /poll_hint: passe offset=7 e wait_ms=60000 \(ate 180000\)/);
   assert.match(startedText, /inicio/);
   const jobId = startedText.match(/job_id: ([0-9a-f-]+)/)?.[1];
   assert.ok(jobId, 'deve retornar job_id');
@@ -241,6 +242,57 @@ test('start_command e poll_command acompanham job em background, sugerem next_of
   const killedText = textOf(killed);
   assert.match(killedText, /status: killed/);
   assert.match(killedText, /exit_code: killed/);
+});
+
+test('start_command e poll_command finalizam rapido mesmo com subprocesso neto segurando pipe, paginam stderr incrementalmente e compactam gh run watch', async () => {
+  // 1. Subprocesso em background herdando stdout nao deve travar a finalizacao do job
+  const t0 = Date.now();
+  const orphanRes = await tool('start_command').handler({
+    command: '(sleep 20 &) && printf "pronto_sem_travar\\n"',
+    wait_ms: 3000,
+  });
+  const orphanElapsed = Date.now() - t0;
+  const orphanText = textOf(orphanRes);
+  assert.match(orphanText, /status: completed/);
+  assert.match(orphanText, /pronto_sem_travar/);
+  assert.ok(orphanElapsed < 2000, `deve finalizar em <2s com drain grace, levou ${orphanElapsed}ms`);
+  const orphanJobId = orphanText.match(/job_id: ([0-9a-f-]+)/)?.[1];
+  assert.ok(orphanJobId);
+  // Encerra eventual sleep residual do grupo de processos
+  await tool('poll_command').handler({ job_id: orphanJobId, kill: true });
+
+  // 2. Paginacao incremental de stderr sincronizada com offset=next_offset e compactacao de gh run watch
+  const watchCmd = [
+    'printf "out1\\n"',
+    'printf "err1\\n" >&2',
+    'sleep 0.3',
+    'printf "Refreshing run status every 3 seconds. Press Ctrl+C to quit.\\nframe1\\n"',
+    'printf "Refreshing run status every 3 seconds. Press Ctrl+C to quit.\\nframe2\\n"',
+    'printf "Refreshing run status every 3 seconds. Press Ctrl+C to quit.\\nframe3_final\\n"',
+    'printf "err2\\n" >&2',
+  ].join('; ');
+  const first = await tool('start_command').handler({
+    command: watchCmd,
+    wait_ms: 100,
+  });
+  const firstText = textOf(first);
+  const jobId = firstText.match(/job_id: ([0-9a-f-]+)/)?.[1];
+  const nextOffset = Number(firstText.match(/next_offset: (\d+)/)?.[1] ?? '0');
+  assert.ok(jobId);
+  assert.match(firstText, /err1/);
+
+  const second = await tool('poll_command').handler({
+    job_id: jobId,
+    offset: nextOffset,
+    wait_ms: 3000,
+  });
+  const secondText = textOf(second);
+  assert.match(secondText, /status: completed/);
+  assert.match(secondText, /compacted_watch_frames: 2/);
+  assert.match(secondText, /frame3_final/);
+  assert.doesNotMatch(secondText, /\nframe1\n/);
+  assert.match(secondText, /err2/);
+  assert.doesNotMatch(secondText, /err1/);
 });
 
 test('read_file bloqueia arquivos binarios com mensagem clara', async () => {
@@ -380,6 +432,318 @@ test('edit_file informa linhas em ocorrencias multiplas e sugere trecho proximo 
           cwd: path.join(root, 'subpasta-inexistente'),
         }),
       /Diretorio pai existente mais proximo/,
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('v1.4.3: dicas inteligentes de caminho (subdiretorios estruturais + ranking por similaridade), filtro pattern em list_directory e piso wait_ms em start_command', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'mcp-dev-test-'));
+  try {
+    // 1. Subdiretorio estrutural (services/crm-api) e ranking por similaridade entre muitas entradas
+    await mkdir(path.join(root, 'services', 'crm-api', 'src'), { recursive: true });
+    await writeFile(path.join(root, 'services', 'crm-api', 'src', 'index.ts'), 'export const ok = true;\n', 'utf8');
+    for (let i = 0; i < 20; i += 1) {
+      await mkdir(path.join(root, `admin-worktree-${String(i).padStart(2, '0')}`), { recursive: true });
+    }
+    await mkdir(path.join(root, 'crm-api-p1-db-review-20261023'), { recursive: true });
+    await writeFile(path.join(root, 'crm-api-p1-db-review-20261023', 'README.md'), '# review\n', 'utf8');
+
+    // Ao pedir root/crm-api (esquecendo services/), deve sugerir root/services/crm-api
+    await assert.rejects(
+      () => tool('list_directory').handler({ path: path.join(root, 'crm-api') }),
+      /Sugestao encontrada: .*services\/crm-api/,
+    );
+
+    // Ao pedir read_file em root/crm-api/src/index.ts, deve sugerir root/services/crm-api/src/index.ts
+    await assert.rejects(
+      () => tool('read_file').handler({ path: path.join(root, 'crm-api', 'src', 'index.ts') }),
+      /Sugestao encontrada: .*services\/crm-api\/src\/index\.ts/,
+    );
+
+    // Ao pedir nome incompleto de worktree entre >20 pastas admin-*, deve ranquear crm-api-p1-db-review-20261023 no topo
+    await assert.rejects(
+      () => tool('list_directory').handler({ path: path.join(root, 'crm-api-p1-db-review') }),
+      /Entradas disponiveis em .*: crm-api-p1-db-review-20261023\//,
+    );
+
+    // 2. list_directory com pattern e alternancia '|'
+    const filteredDir = await tool('list_directory').handler({
+      path: root,
+      pattern: '*db-review*|services',
+    });
+    const filteredText = textOf(filteredDir);
+    assert.match(filteredText, /total: 2/);
+    assert.match(filteredText, /crm-api-p1-db-review-20261023/);
+    assert.match(filteredText, /services/);
+    assert.doesNotMatch(filteredText, /admin-worktree-00/);
+
+    // 3. find_files com glob *db-review* casando nome de diretorio pai via --iglob
+    const foundInWorktree = await tool('find_files').handler({
+      path: root,
+      pattern: '*db-review*',
+    });
+    const foundWorktreeText = textOf(foundInWorktree);
+    assert.match(foundWorktreeText, /returned_files: 1/);
+    assert.match(foundWorktreeText, /crm-api-p1-db-review-20261023\/README\.md/);
+
+    // 4. start_command com wait_ms=1000 aguarda comando rapido de ~1.2s concluir na propria chamada
+    const fastStart = await tool('start_command').handler({
+      command: 'sleep 1.1 && printf "concluido_no_start\\n"',
+      cwd: root,
+      wait_ms: 1000,
+    });
+    const fastStartText = textOf(fastStart);
+    assert.match(fastStartText, /status: completed/);
+    assert.match(fastStartText, /concluido_no_start/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('v1.4.4: extracao automatica de glob em path (search_code, find_files, list_directory) e inspecao de redirecionamento / stream-json em start_command + poll_command', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'mcp-dev-test-v144-'));
+  try {
+    const scriptsDir = path.join(root, 'scripts');
+    await mkdir(scriptsDir, { recursive: true });
+    await writeFile(path.join(scriptsDir, 'crm-p1-hosted-alpha.test.mjs'), 'describe("alpha suite", () => {});\n', 'utf8');
+    await writeFile(path.join(scriptsDir, 'crm-p1-hosted-beta.test.mjs'), 'describe("beta suite", () => {});\n', 'utf8');
+    await writeFile(path.join(scriptsDir, 'other-helper.mjs'), 'describe("ignored helper", () => {});\n', 'utf8');
+
+    // 1. search_code com glob embutido em path
+    const globPath = path.join(scriptsDir, 'crm-p1-hosted-*.test.mjs');
+    const searchRes = await tool('search_code').handler({
+      pattern: 'describe',
+      path: globPath,
+    });
+    const searchText = textOf(searchRes);
+    assert.match(searchText, /exit_code: 0/);
+    assert.match(searchText, /extracted_glob: crm-p1-hosted-\*\.test\.mjs/);
+    assert.match(searchText, /alpha suite/);
+    assert.match(searchText, /beta suite/);
+    assert.doesNotMatch(searchText, /ignored helper/);
+
+    // 2. find_files com glob embutido em path
+    const findRes = await tool('find_files').handler({
+      path: globPath,
+    });
+    const findText = textOf(findRes);
+    assert.match(findText, /returned_files: 2/);
+    assert.match(findText, /crm-p1-hosted-alpha\.test\.mjs/);
+    assert.match(findText, /crm-p1-hosted-beta\.test\.mjs/);
+    assert.doesNotMatch(findText, /other-helper\.mjs/);
+
+    // 3. list_directory com glob embutido em path
+    const listRes = await tool('list_directory').handler({
+      path: globPath,
+    });
+    const listText = textOf(listRes);
+    assert.match(listText, /total: 2/);
+    assert.match(listText, /crm-p1-hosted-alpha\.test\.mjs/);
+
+    // 4. start_command / poll_command com redirecionamento > stream.jsonl e wakeup antecipado em {"event":"result"}
+    const streamFile = path.join(root, 'subagent-stream.jsonl');
+    const errFile = path.join(root, 'subagent-stderr.log');
+    const startRes = await tool('start_command').handler({
+      command: `printf '{"event":"message","text":"iniciando"}\\n' > "${streamFile}" 2> "${errFile}" && sleep 0.3 && printf '{"event":"result","status":"ok"}\\n' >> "${streamFile}" && sleep 30`,
+      cwd: root,
+      wait_ms: 100,
+    });
+    const startText = textOf(startRes);
+    const jobId = startText.match(/job_id: ([a-f0-9-]+)/)?.[1];
+    assert.ok(jobId, 'job_id deve estar presente');
+    assert.match(startText, /redirected_output_files:/);
+
+    const t0 = Date.now();
+    const pollRes = await tool('poll_command').handler({
+      job_id: jobId,
+      wait_ms: 15000,
+    });
+    const elapsedPollMs = Date.now() - t0;
+    const pollText = textOf(pollRes);
+    assert.ok(elapsedPollMs < 8000, `poll_command deveria retornar antecipadamente ao detectar {"event":"result"}, mas levou ${elapsedPollMs}ms`);
+    assert.match(pollText, /stream_json_status: result_ready/);
+    assert.match(pollText, /redirected_output_preview:/);
+    assert.match(pollText, /"event":"result"/);
+
+    // Encerra o job em background
+    await tool('poll_command').handler({ job_id: jobId, kill: true });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('v1.4.5: contexto em ocorrencias multiplas, heuristica aprimorada de edit_file/multi_edit_file, paginacao automatica de stderr com stdout=0, autocorrecao de typo em job_id e engines.node em package.json', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'mcp-dev-test-v145-'));
+  try {
+    // 1. multi_edit_file: contexto nas ocorrencias multiplas + idempotencia para edicao duplicada no mesmo lote
+    const specFile = path.join(root, 'sample.tsx');
+    await writeFile(
+      specFile,
+      [
+        'export function Form() {',
+        '  return (',
+        '    <Shell',
+        '      title="Nova Demanda"',
+        '      sidebarDescription="As novas demandas entram no estado NEW e avancam pela triagem."',
+        '    >',
+        '      <div className="border-slate-300 text-slate-900">Bloco A</div>',
+        '      <button type="submit">Salvar</button>',
+        '      <div className="border-slate-300 text-slate-700">Bloco B</div>',
+        '      <button type="submit">Salvar</button>',
+        '    </Shell>',
+        '  );',
+        '}',
+      ].join('\n'),
+      'utf8',
+    );
+
+    // Ocorrencias multiplas deve mostrar contexto das primeiras ocorrencias
+    await assert.rejects(
+      () =>
+        tool('edit_file').handler({
+          path: specFile,
+          old_string: '      <button type="submit">Salvar</button>',
+          new_string: '      <button type="submit">Confirmar</button>',
+        }),
+      /Contexto das primeiras ocorrencias:[\s\S]*Bloco A[\s\S]*Bloco B/,
+    );
+
+    // Ancora por propriedade JSX (sidebarDescription=...) deve sugerir a linha correta mesmo quando o texto interno mudou
+    await assert.rejects(
+      () =>
+        tool('edit_file').handler({
+          path: specFile,
+          old_string: '      sidebarDescription="Texto antigo completamente diferente sobre solicitacao."',
+          new_string: '      sidebarDescription="Novo texto"',
+        }),
+      /Trecho similar encontrado proximo a linha 5:[\s\S]*sidebarDescription="As novas demandas/,
+    );
+
+    // Edicao duplicada dentro do mesmo lote de multi_edit_file deve ser tratada como no-op idempotente
+    const batchRes = await tool('multi_edit_file').handler({
+      path: specFile,
+      edits: [
+        { old_string: 'border-slate-300', new_string: 'border-input', replace_all: true },
+        { old_string: 'text-slate-900', new_string: 'text-foreground', replace_all: true },
+        { old_string: 'border-slate-300', new_string: 'border-input', replace_all: true },
+      ],
+    });
+    assert.match(textOf(batchRes), /Arquivo editado:/);
+
+    // 2. start_command / poll_command: paginacao automatica de stderr quando stdout=0 + autocorrecao de 1-char typo no UUID
+    const startRes = await tool('start_command').handler({
+      command: 'printf "stderr_chunk_1\\n" >&2 && sleep 0.4 && printf "stderr_chunk_2\\n" >&2 && sleep 20',
+      cwd: root,
+      wait_ms: 150,
+    });
+    const startText = textOf(startRes);
+    const jobId = startText.match(/job_id: ([0-9a-f-]{36})/)?.[1];
+    assert.ok(jobId, 'jobId deve existir');
+    assert.match(startText, /stderr_chunk_1/);
+
+    await new Promise((r) => setTimeout(r, 450));
+
+    // Simula typo de 1 caractere hexadecimal no meio do job_id
+    const chars = jobId.split('');
+    const flipIdx = 15;
+    chars[flipIdx] = chars[flipIdx] === 'a' ? 'b' : 'a';
+    const typoJobId = chars.join('');
+
+    const pollRes = await tool('poll_command').handler({
+      job_id: typoJobId,
+      offset: 0,
+      wait_ms: 50,
+    });
+    const pollText = textOf(pollRes);
+    assert.match(pollText, new RegExp(`job_id: ${jobId}`));
+    assert.match(pollText, new RegExp(`job_id_autocorrected_from: ${typoJobId}`));
+    // Deve conter apenas stderr_chunk_2 (paginacao incremental de stderr quando stdout continua 0)
+    assert.doesNotMatch(pollText, /stderr_chunk_1/);
+    assert.match(pollText, /stderr_chunk_2/);
+
+    await tool('poll_command').handler({ job_id: jobId, kill: true });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('v1.4.6: multi_edit_file sequencial em blocos repetidos, normalizacao de trailing spaces/CRLF, ancoragem por alta entropia e delete_path em diretorio vazio', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'mcp-dev-test-v146-'));
+  try {
+    // 1. multi_edit_file: consumo sequencial quando o lote possui N edicoes para N ocorrencias identicas
+    const yamlFile = path.join(root, 'EXECUTION.yaml');
+    await writeFile(
+      yamlFile,
+      [
+        'work_packages:',
+        '  - id: WP-PLAN-001',
+        '    status: EXECUTING',
+        '    blockers: []',
+        '  - id: WP-PLAN-002',
+        '    status: READY',
+        '    owner: null',
+        '  - id: WP-PLAN-003',
+        '    status: READY',
+        '    owner: null',
+        '  - id: WP-PLAN-005',
+        '    status: COMPLETED   ',
+        '    blockers: []   ',
+        '    summary: "Entrega finalizada do WP-PLAN-005"',
+      ].join('\n'),
+      'utf8',
+    );
+
+    const seqRes = await tool('multi_edit_file').handler({
+      path: yamlFile,
+      edits: [
+        { old_string: '    status: READY\n    owner: null', new_string: '    status: EXECUTING\n    owner: agent-a' },
+        { old_string: '    status: READY\n    owner: null', new_string: '    status: EXECUTING\n    owner: agent-b' },
+      ],
+    });
+    assert.match(textOf(seqRes), /2 bloco\(s\) aplicados, 2 substituicao\(oes\)/);
+    const afterSeq = await readFile(yamlFile, 'utf8');
+    assert.match(afterSeq, /id: WP-PLAN-002\n    status: EXECUTING\n    owner: agent-a/);
+    assert.match(afterSeq, /id: WP-PLAN-003\n    status: EXECUTING\n    owner: agent-b/);
+
+    // 2. Normalizacao automatica quando a unica diferenca sao espacos em branco no final da linha
+    await tool('edit_file').handler({
+      path: yamlFile,
+      old_string: '  - id: WP-PLAN-005\n    status: COMPLETED\n    blockers: []',
+      new_string: '  - id: WP-PLAN-005\n    status: VERIFIED\n    blockers: []',
+    });
+    const afterNorm = await readFile(yamlFile, 'utf8');
+    assert.match(afterNorm, /id: WP-PLAN-005\n    status: VERIFIED/);
+
+    // 3. Hint de alta entropia em multi_edit_file + indicacao de edicoes anteriores validadas OK
+    await assert.rejects(
+      () =>
+        tool('multi_edit_file').handler({
+          path: yamlFile,
+          edits: [
+            { old_string: '  - id: WP-PLAN-001', new_string: '  - id: WP-PLAN-001' },
+            {
+              old_string: '    status: EXECUTING\n    blockers: []\n    summary: "Resumo antigo do WP-PLAN-005"',
+              new_string: '    status: DONE',
+            },
+          ],
+        }),
+      /Edicao #2 \(edicoes #1\.\.#1 validadas OK\):[\s\S]*WP-PLAN-005/,
+    );
+
+    // 4. delete_path em diretorio vazio sem recursive=true deve excluir sem erro; em nao-vazio deve orientar recursive=true
+    const emptyDir = path.join(root, 'empty-folder');
+    await mkdir(emptyDir, { recursive: true });
+    const delEmpty = await tool('delete_path').handler({ path: emptyDir });
+    assert.match(textOf(delEmpty), /Excluido:/);
+
+    const nonEmptyDir = path.join(root, 'non-empty-folder');
+    await mkdir(nonEmptyDir, { recursive: true });
+    await writeFile(path.join(nonEmptyDir, 'file.txt'), 'ok', 'utf8');
+    await assert.rejects(
+      () => tool('delete_path').handler({ path: nonEmptyDir }),
+      /Passe recursive=true em delete_path/,
     );
   } finally {
     await rm(root, { recursive: true, force: true });

@@ -1,6 +1,6 @@
 # Ferramentas MCP e Guia de Orientação de Uso
 
-A versão `1.4.0` expõe **16 ferramentas**. O catálogo é definido em `src/tools.ts`, registrado dinamicamente pelo servidor em `src/server.ts` e acompanhado por instruções de protocolo (`instructions`) enviadas automaticamente no handshake `initialize`.
+A versão `1.4.5` expõe **16 ferramentas**. O catálogo é definido em `src/tools.ts`, registrado dinamicamente pelo servidor em `src/server.ts` e acompanhado por instruções de protocolo (`instructions`) enviadas automaticamente no handshake `initialize`.
 
 ## Visão geral
 
@@ -73,7 +73,8 @@ Entradas:
 Comportamento e salvaguardas:
 
 - **Exclusão automática de diretórios pesados**: exclui por padrão `node_modules`, `.git`, `.next`, `dist`, `build`, `coverage` e `/root/repos/work`, a menos que `path` ou `globs` apontem explicitamente para um deles.
-- **Diagnóstico de `ENOENT`**: se `path` não existir, retorna erro amigável indicando o diretório pai existente mais próximo e listando suas entradas imediatas.
+- **Extração automática de glob em `path`**: se `path` contiver curingas ao final (ex.: `/dir/scripts/crm-p1-*.test.mjs`), separa automaticamente o diretório base existente (`/dir/scripts`) e aplica o sufixo (`crm-p1-*.test.mjs`) como filtro `--glob`, evitando falha por `ENOENT` (também suportado em `find_files` e `list_directory`).
+- **Diagnóstico de `ENOENT`**: se `path` não existir, retorna erro amigável indicando o diretório pai existente mais próximo, sugestões estruturais (`services/`, `packages/`, `apps/`, etc.) e entradas similares ranqueadas.
 - **Fallback automático de regex inválido**: se `fixed_strings` não for informado e `pattern` contiver metacaracteres desbalanceados (ex.: `"Inter("`, `"foo[bar"`), o `rg` retorna erro de sintaxe de regex (`exit_code: 2`) e o servidor **repete automaticamente a busca em modo literal (`--fixed-strings`)**, sinalizando `mode: fixed_strings_fallback (regex invalido tratado como texto literal)`.
 - **Zero ocorrências sem erro**: quando nada é encontrado (`rg` exit code 1), retorna `exit_code: 0` e `matches: 0`.
 
@@ -230,7 +231,7 @@ A resposta informa `total_chars`, `total_bytes`, `has_more` e `next_offset`. Art
 
 ### `start_command`
 
-Inicia um comando shell em background e aguarda até `wait_ms` (padrão `5000` ms, máximo `30000` ms).
+Inicia um comando shell em background e aguarda até `wait_ms` (padrão `10000` ms, máximo `120000` ms).
 
 Entradas:
 
@@ -238,33 +239,36 @@ Entradas:
 |---|---|---:|---:|
 | `command` | string | obrigatório | — |
 | `cwd` | string | home do usuário | — |
-| `wait_ms` | inteiro | `5000` | `0` a `30000` |
-| `timeout_ms` | inteiro | `600000` | `1000` a `1800000` |
+| `wait_ms` | inteiro | `10000` | `0` a `120000` |
+| `timeout_ms` | inteiro | `1200000` | `1` a `3600000` |
 
 Comportamento:
 
-- Se o comando terminar dentro de `wait_ms`, já devolve `status: exited` e o resultado completo;
-- Se continuar rodando, devolve `job_id`, `status: running`, `next_offset` e um `poll_hint` orientando o próximo `poll_command`;
-- Mantém histórico de até 200 jobs em memória com retenção de 2 horas após o término.
+- Se o comando terminar dentro de `wait_ms` (retornando no exato milissegundo em que o processo encerrar), já devolve `status: completed` e o resultado completo;
+- Se continuar rodando, devolve `job_id`, `status: running`, `process_alive: true`, `next_offset` e um `poll_hint` adaptativo orientando o próximo `poll_command`;
+- Finaliza imediatamente após o `exit` do processo `/bin/bash -c` (com janela de drenagem de `250ms` para pipes), mesmo que processos netos em background herdem descritores `stdout`/`stderr`;
+- Persiste snapshots em disco (`/tmp/mcp-dev-agent-jobs/<job_id>.json`) além do cache em memória (até 200 jobs com retenção de 2 horas), sobrevivendo a reinicializações do serviço.
 
 ---
 
 ### `poll_command`
 
-Consulta o andamento, lê novas saídas ou encerra um job iniciado por `start_command`.
+Consulta o andamento, lê novas saídas incrementais (`stdout` e `stderr`) ou encerra um job iniciado por `start_command`.
 
 Entradas:
 
 | Campo | Tipo | Padrão | Limite |
 |---|---|---:|---:|
 | `job_id` | UUID | obrigatório | — |
-| `wait_ms` | inteiro | `5000` | `0` a `30000` |
+| `wait_ms` | inteiro | `60000` | `0` a `180000` |
 | `offset` | inteiro | `0` | >= 0 |
-| `limit` | inteiro | `30000` | `1` a `30000` |
+| `stderr_offset` | inteiro | automático | >= 0 |
 | `kill` | boolean | `false` | — |
 
-**Dica crítica de performance (`offset=next_offset`)**:
-Ao acompanhar um job que ainda está `running`, passe `offset` igual ao `next_offset` retornado na chamada anterior. Isso lê **apenas o stdout novo** produzido desde a última consulta, evitando reenviar todo o log acumulado a cada poll.
+**Dicas críticas de performance (`offset=next_offset`, `wait_ms` longo e compactação de `gh run watch`)**:
+- Ao acompanhar um job que ainda está `running`, passe `offset` igual ao `next_offset` retornado na chamada anterior e `wait_ms` entre `60000` e `180000` (use `120000` a `180000` para `agy`, `vitest`, `playwright`, `gh run watch` e builds longos — se o processo concluir antes, `poll_command` retorna imediatamente). Isso lê **apenas o `stdout` e o `stderr` novos** produzidos desde a última consulta, evitando reenviar logs acumulados a cada poll;
+- **Inspeção automática de arquivos redirecionados (`> /caminho/arquivo`) e detecção de `stream-json`**: quando o comando redireciona `stdout`/`stderr` para arquivos no disco (ex.: `agy ... > stream.jsonl 2> stderr.log`), `start_command` e `poll_command` informam automaticamente `redirected_output_files` (com tamanho atualizado em bytes), `redirected_output_preview` (cauda recente do arquivo) e `stream_json_status: result_ready` assim que um evento final `{"event":"result"}` é gravado, liberando o `poll_command` antecipadamente sem aguardar o fim do timeout;
+- Saídas repetitivas de `gh run watch` (`Refreshing run status every ... seconds`) têm seus frames intermediários automaticamente colapsados para preservar apenas o snapshot mais recente sem alterar `next_offset`.
 
 ---
 
@@ -276,7 +280,7 @@ Lê uma imagem do filesystem (PNG, JPEG, GIF, WebP) e retorna um bloco `ImageCon
 
 ### `list_directory`
 
-Lista arquivos, diretórios e links simbólicos em ordem alfabética com paginação (`path`, `offset` padrão `0`, `limit` padrão `200`, máx `1000`, `max_depth` padrão `1`, máx `4`). Quando `max_depth > 1`, percorre subdiretórios ignorando automaticamente `node_modules`, `.git`, `.next`, `dist`, `build` e `coverage`.
+Lista arquivos, diretórios e links simbólicos em ordem alfabética com paginação (`path`, `pattern` opcional para filtrar por substring/glob com `|`, `offset` padrão `0`, `limit` padrão `200`, máx `1000`, `max_depth` padrão `1`, máx `4`). Quando `max_depth > 1`, percorre subdiretórios ignorando automaticamente `node_modules`, `.git`, `.next`, `dist`, `build` e `coverage`.
 
 ### `move_file`
 
@@ -308,3 +312,16 @@ Exclui arquivo ou diretório (`path`, `recursive` padrão `false`). Operação i
 ### 3. Auditoria visual / UX
 1. Gere os screenshots da aplicação (ex.: Playwright);
 2. Chame `read_image` diretamente sobre os arquivos `.png`/`.webp` gerados.
+
+---
+
+## Painel `/logs` e Acompanhamento de KPIs (`/logs/kpis`)
+
+O painel em tempo real em `/logs` possui 4 abas:
+1. **Transações em Tempo Real**: stream SSE de todas as chamadas e eventos com expansão de argumentos e preview.
+2. **Conexões e Sessões MCP**: sessões ativas/encerradas, cliente, IP e contadores.
+3. **Alertas**: watchdog configurável de inatividade com alerta sonoro via Web Audio API e histórico de incidentes.
+4. **KPI's (`#kpis` / `GET /logs/kpis`)**:
+   - **Termômetro de Massa Crítica**: acompanha os 4 pilares para reavaliação estatística (`>= 1.500` chamadas totais, `>= 200` edições `edit_file` + `multi_edit_file`, `>= 80` chamadas `poll_command`, ou critério híbrido de `7 dias` com mínimo de `1.000` chamadas), classificando em `COLETA_INICIAL`, `PRELIMINAR` (`>= 500` calls, `>= 75` edições, `>= 30` polls) ou `PRONTA`.
+   - **6 Scorecards Qualitativos com comparativo de baseline (`v1.4.5` vs `v1.4.4`)**: Confiabilidade Global (`>= 99%`), Qualidade de Edição e Auto-Recuperação sem `read_file` (*Self-Heal*), Eficiência de Jobs e Polling (`wait_ms >= 60s`), Higiene de Ambiente e Ferramentas Nativas (`NVM manual = 0`), Economia de Contexto e Batching, e Latência Nativa Local (`p50`/`p95`).
+   - **Tabela por Ferramenta e Diagnóstico de Erros/Anti-Padrões**: detalha volume, taxas de erro, latências `p50/p95`, payload médio e assinaturas residuais.

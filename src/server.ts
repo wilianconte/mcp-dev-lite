@@ -61,15 +61,15 @@ const toolDescriptors = tools.map((tool) => ({
 /** Cria uma instancia do servidor MCP com todas as ferramentas registradas. */
 function buildServer(context: AuditRequestContext = {}): McpServer {
   const server = new McpServer(
-    { name: "mcp-dev-agent", version: "1.4.0" },
+    { name: "mcp-dev-agent", version: "1.4.6" },
     {
       instructions:
         "Servidor de desenvolvimento na VM (16 ferramentas). Siga estas diretrizes de escolha de ferramentas para maxima performance:\n" +
-        "1. LOCALIZACAO DE ARQUIVOS E DIRETORIOS: Use find_files para localizar arquivos por nome, substring ou glob, aceitando alternancia com '|' (ex.: pattern='sidebar', pattern='*inbox*|*media*|*.spec.ts', max_depth=1..10) e list_directory (com max_depth de 1 a 4) para explorar a estrutura de pastas. Nunca use find/ls via run_command.\n" +
+        "1. LOCALIZACAO DE ARQUIVOS E DIRETORIOS: Use find_files para localizar arquivos por nome, substring ou glob, aceitando alternancia com '|' (ex.: pattern='sidebar', pattern='*inbox*|*media*|*.spec.ts', max_depth=1..10) e list_directory (com pattern opcional para filtrar por nome/glob e max_depth de 1 a 4) para explorar a estrutura de pastas. Nunca use find/ls via run_command.\n" +
         "2. BUSCA EM CODIGO: Use SEMPRE search_code (ripgrep nativo) para buscar texto/regex dentro de arquivos. Passe o path mais especifico possivel (ex.: '/root/repos/app/src') e use fixed_strings=true ao buscar trechos literais com (), {}, [] ou $.\n" +
         "3. LEITURA DE ARQUIVOS: Para 1 arquivo use read_file; para 2 a 20 arquivos (ou 2 ou mais faixas offset/limit distantes do mesmo arquivo grande) use read_files em lote (leitura paralela). Evite cat/head/tail/sed via run_command. Arquivos binarios sao bloqueados automaticamente.\n" +
         "4. EDICAO DE ARQUIVOS: Para alterar 1 trecho use edit_file; para alterar 2 ou mais trechos no mesmo arquivo use multi_edit_file (atomico); para criar/sobrescrever o arquivo inteiro use write_file.\n" +
-        "5. COMANDOS CURTOS VS LONGOS: Use run_command apenas para operacoes rapidas (<30s, como git status, git diff, gh pr view). Para builds, suites de teste, deploys, instalacoes, gh run watch, pipelines encadeados (lint && build && test) ou invocacao de subagentes CLI (agy), use SEMPRE start_command seguido de poll_command passando offset=next_offset da chamada anterior para ler apenas novas linhas.\n" +
+        "5. COMANDOS CURTOS VS LONGOS: Use run_command apenas para operacoes rapidas (<30s, como git status, git diff, gh pr view). Para builds, suites de teste, deploys, instalacoes, gh run watch (use 'gh run watch <id> --interval 15'), pipelines encadeados (lint && build && test) ou invocacao de subagentes CLI (agy), use SEMPRE start_command seguido de poll_command passando offset=next_offset da chamada anterior e wait_ms=60000..180000 (use 120000..180000 para agy, vitest, playwright, gh run watch e builds longos) para aguardar apenas novas linhas (stdout/stderr) sem polling excessivo.\n" +
         "6. SAIDAS GRANDES E IMAGENS: Saidas >30k chars geram artifact_id para leitura paginada via read_command_output. Para screenshots/imagens (PNG/JPEG/GIF/WebP), use read_image (ImageContent MCP nativo).",
     },
   );

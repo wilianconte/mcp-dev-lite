@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { promises as fs } from "node:fs";
+import { existsSync, readFileSync, readdirSync, promises as fs } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { z } from "zod";
@@ -19,9 +19,26 @@ const DEFAULT_MAX_IMAGE_BYTES = 10 * 1024 * 1024;
 const DEFAULT_MAX_TEXT_FILE_BYTES = 10 * 1024 * 1024;
 const BINARY_SNIFF_BYTES = 8_192;
 const DEFAULT_COMMAND_MAX_BUFFER_BYTES = 50 * 1024 * 1024;
-const MAX_STORED_JOBS = 200;
-const JOB_RETENTION_MS = 2 * 60 * 60 * 1000;
-const DEFAULT_SEARCH_IGNORE_DIRS = ["node_modules", ".git", ".next", "dist", "build", "coverage"];
+const MAX_STORED_JOBS = 500;
+const JOB_RETENTION_MS = 12 * 60 * 60 * 1000;
+const EXIT_PIPE_DRAIN_GRACE_MS = 250;
+const JOBS_STORE_DIR = path.join(os.tmpdir(), "mcp-dev-agent-jobs");
+const DEFAULT_SEARCH_IGNORE_DIRS = [
+  "node_modules",
+  ".git",
+  ".next",
+  "dist",
+  "build",
+  "coverage",
+  ".venv",
+  "venv",
+  "__pycache__",
+  ".pytest_cache",
+  ".turbo",
+  ".cache",
+  "playwright-report",
+  "test-results",
+];
 
 function textResult(text: string): CallToolResult {
   return { content: [{ type: "text", text }] };
@@ -54,12 +71,142 @@ function killProcessGroup(pid: number | undefined, signal: NodeJS.Signals): void
   }
 }
 
+function isProcessAlive(pid: number | undefined): boolean {
+  if (!pid) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException)?.code === "EPERM";
+  }
+}
+
+const commandEnvCache = new Map<string, { expiresAt: number; pathValue: string }>();
+const COMMAND_ENV_CACHE_TTL_MS = 60_000;
+const numericVersionCollator = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
+
+function extractNodeVersionFromPackageJson(pkgPath: string, currentMajor: number): string {
+  try {
+    const raw = readFileSync(pkgPath, "utf8");
+    const pkg = JSON.parse(raw) as {
+      volta?: { node?: unknown };
+      engines?: { node?: unknown };
+    };
+    if (typeof pkg?.volta?.node === "string" && pkg.volta.node.trim()) {
+      return pkg.volta.node.trim().replace(/^v/i, "");
+    }
+    const engineSpec = typeof pkg?.engines?.node === "string" ? pkg.engines.node.trim() : "";
+    if (!engineSpec) return "";
+    // Se for apenas um piso ">=X" e o Node atual do processo ja atende X, mantem o Node atual.
+    const floorMatch = engineSpec.match(/^>=\s*v?(\d+)(?:\.\d+){0,2}$/i);
+    if (floorMatch) {
+      const reqMajor = Number(floorMatch[1]);
+      if (Number.isFinite(reqMajor) && reqMajor > currentMajor) {
+        return String(reqMajor);
+      }
+      return "";
+    }
+    const versionMatches = Array.from(engineSpec.matchAll(/v?(\d+(?:\.\d+){0,2})/gi)).map((m) => m[1]);
+    if (versionMatches.length === 0) return "";
+    const chosen = versionMatches.sort((a, b) => numericVersionCollator.compare(a, b))[versionMatches.length - 1];
+    const major = Number(chosen.split(".")[0]);
+    if (engineSpec.includes(">=") && Number.isFinite(major) && major <= currentMajor) {
+      return "";
+    }
+    return chosen;
+  } catch {
+    return "";
+  }
+}
+
+function resolveNvmNodeBin(cwd: string): string | undefined {
+  const nvmVersionsDir = path.join(os.homedir(), ".nvm", "versions", "node");
+  if (!existsSync(nvmVersionsDir)) return undefined;
+  const currentMajor = Number(process.versions.node.split(".")[0]) || 22;
+  let dir = cwd;
+  let requested = "";
+  let fallbackEngineRequested = "";
+  for (let depth = 0; depth < 8; depth += 1) {
+    for (const rcFile of [".nvmrc", ".node-version"]) {
+      const rcPath = path.join(dir, rcFile);
+      if (existsSync(rcPath)) {
+        try {
+          requested = readFileSync(rcPath, "utf8").split(/\r?\n/)[0].trim().replace(/^v/i, "");
+        } catch {
+          requested = "";
+        }
+        if (requested) break;
+      }
+    }
+    if (requested) break;
+    if (!fallbackEngineRequested) {
+      const pkgPath = path.join(dir, "package.json");
+      if (existsSync(pkgPath)) {
+        fallbackEngineRequested = extractNodeVersionFromPackageJson(pkgPath, currentMajor);
+      }
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  const targetVersion = requested || fallbackEngineRequested;
+  if (!targetVersion) return undefined;
+  try {
+    const installed = readdirSync(nvmVersionsDir).sort((a, b) => numericVersionCollator.compare(a, b));
+    const prefix = `v${targetVersion}`;
+    const exactOrPrefix = installed.filter((name) => name === prefix || name.startsWith(`${prefix}.`));
+    let chosen = exactOrPrefix[exactOrPrefix.length - 1];
+    if (!chosen && !requested && fallbackEngineRequested) {
+      const reqMajor = Number(fallbackEngineRequested.split(".")[0]);
+      if (Number.isFinite(reqMajor)) {
+        const geCandidates = installed.filter((name) => {
+          const m = Number(name.replace(/^v/i, "").split(".")[0]);
+          return Number.isFinite(m) && m >= reqMajor;
+        });
+        chosen = geCandidates[geCandidates.length - 1];
+      }
+    }
+    if (!chosen) return undefined;
+    const binDir = path.join(nvmVersionsDir, chosen, "bin");
+    return existsSync(binDir) ? binDir : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function buildCommandEnv(cwd: string): NodeJS.ProcessEnv {
+  const now = Date.now();
+  const basePath = process.env.PATH ?? "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+  const cacheKey = `${cwd}::${basePath}`;
+  const cached = commandEnvCache.get(cacheKey);
+  if (cached && cached.expiresAt > now) {
+    return { ...process.env, PATH: cached.pathValue };
+  }
+
+  const prependDirs: string[] = [];
+  const nvmBin = resolveNvmNodeBin(cwd);
+  if (nvmBin) {
+    prependDirs.push(nvmBin);
+  }
+  const localBin = path.join(os.homedir(), ".local", "bin");
+  if (existsSync(localBin)) {
+    prependDirs.push(localBin);
+  }
+
+  const parts = [...prependDirs, ...basePath.split(path.delimiter).filter(Boolean)];
+  const deduped = Array.from(new Set(parts)).join(path.delimiter);
+  commandEnvCache.set(cacheKey, { expiresAt: now + COMMAND_ENV_CACHE_TTL_MS, pathValue: deduped });
+  return { ...process.env, PATH: deduped };
+}
+
 function executeCommand(command: string, cwd: string, timeoutMs: number): Promise<CommandExecution> {
   return new Promise((resolve) => {
     let timedOut = false;
     let maxBufferExceeded = false;
     let spawnError: string | undefined;
     let killTimer: NodeJS.Timeout | undefined;
+    let exitDrainTimer: NodeJS.Timeout | undefined;
+    let settled = false;
     const maxBuffer = configuredPositiveNumber("MCP_COMMAND_MAX_BUFFER_BYTES", DEFAULT_COMMAND_MAX_BUFFER_BYTES);
     const stdoutChunks: Buffer[] = [];
     const stderrChunks: Buffer[] = [];
@@ -67,6 +214,7 @@ function executeCommand(command: string, cwd: string, timeoutMs: number): Promis
 
     const child = spawn("/bin/bash", ["-c", command], {
       cwd,
+      env: buildCommandEnv(cwd),
       detached: process.platform !== "win32",
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -80,7 +228,7 @@ function executeCommand(command: string, cwd: string, timeoutMs: number): Promis
     };
 
     const capture = (chunks: Buffer[], chunk: Buffer): void => {
-      if (maxBufferExceeded) return;
+      if (maxBufferExceeded || settled) return;
       const remaining = maxBuffer - capturedBytes;
       if (remaining <= 0) {
         maxBufferExceeded = true;
@@ -110,10 +258,20 @@ function executeCommand(command: string, cwd: string, timeoutMs: number): Promis
     }, timeoutMs);
     timeoutTimer.unref();
 
-    child.on("close", (code, signal) => {
+    const finalize = (code: number | null, signal: NodeJS.Signals | null): void => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timeoutTimer);
       if (killTimer) clearTimeout(killTimer);
+      if (exitDrainTimer) clearTimeout(exitDrainTimer);
       if (timedOut || maxBufferExceeded) killProcessGroup(child.pid, "SIGKILL");
+      try {
+        child.stdout.destroy();
+        child.stderr.destroy();
+        child.unref();
+      } catch {
+        // Ignora erro ao destruir pipes ja fechados.
+      }
       const errorMessage = spawnError ?? (signal && !timedOut && !maxBufferExceeded ? `Processo encerrado por sinal ${signal}.` : undefined);
       resolve({
         exitCode: timedOut ? "timeout" : maxBufferExceeded ? "output_limit" : code ?? "desconhecido",
@@ -123,7 +281,16 @@ function executeCommand(command: string, cwd: string, timeoutMs: number): Promis
         maxBufferExceeded,
         errorMessage,
       });
+    };
+
+    child.on("exit", (code, signal) => {
+      if (!settled && !exitDrainTimer) {
+        exitDrainTimer = setTimeout(() => finalize(code, signal), EXIT_PIPE_DRAIN_GRACE_MS);
+        exitDrainTimer.unref();
+      }
     });
+
+    child.on("close", (code, signal) => finalize(code, signal));
   });
 }
 
@@ -138,32 +305,181 @@ interface BackgroundJob {
   exitCode: number | string | null;
   stdoutChunks: Buffer[];
   stderrChunks: Buffer[];
+  stderrOffsetByStdoutOffset: Map<number, number>;
+  lastReturnedStderrOffset?: number;
   capturedBytes: number;
   timedOut: boolean;
   maxBufferExceeded: boolean;
   killedByUser: boolean;
+  recoveredFromDisk?: boolean;
+  streamJsonResultNotified?: boolean;
   errorMessage?: string;
   waiters: Set<() => void>;
   terminate: (byUser?: boolean) => void;
 }
 
+interface PersistedJobSnapshot {
+  id: string;
+  command: string;
+  cwd: string;
+  pid?: number;
+  startedAtMs: number;
+  finishedAtMs?: number;
+  status: "running" | "completed" | "timed_out" | "output_limit" | "killed";
+  exitCode: number | string | null;
+  stdout: string;
+  stderr: string;
+  stderrOffsets?: Array<[number, number]>;
+  lastReturnedStderrOffset?: number;
+  capturedBytes: number;
+  timedOut: boolean;
+  maxBufferExceeded: boolean;
+  killedByUser: boolean;
+  errorMessage?: string;
+}
+
 const backgroundJobs = new Map<string, BackgroundJob>();
+
+function jobSnapshotPath(id: string): string {
+  return path.join(JOBS_STORE_DIR, `${id}.json`);
+}
+
+async function persistJobSnapshot(job: BackgroundJob): Promise<void> {
+  try {
+    await fs.mkdir(JOBS_STORE_DIR, { recursive: true });
+    const snapshot: PersistedJobSnapshot = {
+      id: job.id,
+      command: job.command,
+      cwd: job.cwd,
+      pid: job.pid,
+      startedAtMs: job.startedAtMs,
+      finishedAtMs: job.finishedAtMs,
+      status: job.status,
+      exitCode: job.exitCode,
+      stdout: Buffer.concat(job.stdoutChunks).toString("utf8"),
+      stderr: Buffer.concat(job.stderrChunks).toString("utf8"),
+      stderrOffsets: Array.from(job.stderrOffsetByStdoutOffset.entries()),
+      lastReturnedStderrOffset: job.lastReturnedStderrOffset,
+      capturedBytes: job.capturedBytes,
+      timedOut: job.timedOut,
+      maxBufferExceeded: job.maxBufferExceeded,
+      killedByUser: job.killedByUser,
+      errorMessage: job.errorMessage,
+    };
+    const filePath = jobSnapshotPath(job.id);
+    const tmpPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
+    await fs.writeFile(tmpPath, JSON.stringify(snapshot), "utf8");
+    await fs.rename(tmpPath, filePath);
+  } catch {
+    // Falha de persistencia em disco nao deve interromper a execucao do job.
+  }
+}
+
+async function loadPersistedJob(id: string): Promise<BackgroundJob | undefined> {
+  try {
+    const raw = await fs.readFile(jobSnapshotPath(id), "utf8");
+    const snap = JSON.parse(raw) as PersistedJobSnapshot;
+    let killTimer: NodeJS.Timeout | undefined;
+    const job: BackgroundJob = {
+      id: snap.id,
+      command: snap.command,
+      cwd: snap.cwd,
+      pid: snap.pid,
+      startedAtMs: snap.startedAtMs,
+      finishedAtMs: snap.finishedAtMs,
+      status: snap.status,
+      exitCode: snap.exitCode,
+      stdoutChunks: snap.stdout ? [Buffer.from(snap.stdout, "utf8")] : [],
+      stderrChunks: snap.stderr ? [Buffer.from(snap.stderr, "utf8")] : [],
+      stderrOffsetByStdoutOffset: new Map(snap.stderrOffsets ?? [[0, 0]]),
+      lastReturnedStderrOffset: snap.lastReturnedStderrOffset ?? 0,
+      capturedBytes: snap.capturedBytes ?? 0,
+      timedOut: Boolean(snap.timedOut),
+      maxBufferExceeded: Boolean(snap.maxBufferExceeded),
+      killedByUser: Boolean(snap.killedByUser),
+      recoveredFromDisk: true,
+      errorMessage: snap.errorMessage,
+      waiters: new Set(),
+      terminate: (byUser = false) => {
+        if (job.status !== "running") return;
+        if (byUser) job.killedByUser = true;
+        killProcessGroup(job.pid, "SIGTERM");
+        if (!killTimer) {
+          killTimer = setTimeout(() => killProcessGroup(job.pid, "SIGKILL"), 1_000);
+          killTimer.unref();
+        }
+        job.finishedAtMs = Date.now();
+        job.status = byUser ? "killed" : "completed";
+        job.exitCode = byUser ? "killed" : (job.exitCode ?? "terminated");
+        void persistJobSnapshot(job);
+        for (const notify of job.waiters) notify();
+        job.waiters.clear();
+      },
+    };
+    if (job.status === "running" && !isProcessAlive(job.pid)) {
+      job.status = "completed";
+      job.exitCode = job.exitCode ?? "0 (recovered_after_restart)";
+      job.finishedAtMs = job.finishedAtMs ?? Date.now();
+      await persistJobSnapshot(job);
+    }
+    backgroundJobs.set(job.id, job);
+    return job;
+  } catch {
+    return undefined;
+  }
+}
 
 function pruneBackgroundJobs(): void {
   const now = Date.now();
   for (const [id, job] of backgroundJobs.entries()) {
     if (job.status !== "running" && job.finishedAtMs && now - job.finishedAtMs > JOB_RETENTION_MS) {
       backgroundJobs.delete(id);
+      void fs.unlink(jobSnapshotPath(id)).catch(() => undefined);
     }
   }
-  if (backgroundJobs.size <= MAX_STORED_JOBS) return;
-  const finished = Array.from(backgroundJobs.values())
-    .filter((j) => j.status !== "running")
-    .sort((a, b) => (a.finishedAtMs ?? 0) - (b.finishedAtMs ?? 0));
-  while (backgroundJobs.size > MAX_STORED_JOBS && finished.length > 0) {
-    const oldest = finished.shift()!;
-    backgroundJobs.delete(oldest.id);
+  if (backgroundJobs.size > MAX_STORED_JOBS) {
+    const finished = Array.from(backgroundJobs.values())
+      .filter((j) => j.status !== "running")
+      .sort((a, b) => (a.finishedAtMs ?? 0) - (b.finishedAtMs ?? 0));
+    while (backgroundJobs.size > MAX_STORED_JOBS && finished.length > 0) {
+      const oldest = finished.shift()!;
+      backgroundJobs.delete(oldest.id);
+      void fs.unlink(jobSnapshotPath(oldest.id)).catch(() => undefined);
+    }
   }
+  void fs
+    .readdir(JOBS_STORE_DIR)
+    .then(async (entries) => {
+      for (const entry of entries) {
+        if (!entry.endsWith(".json")) continue;
+        const jobId = entry.slice(0, -5);
+        const inMemory = backgroundJobs.get(jobId);
+        if (inMemory && (inMemory.status === "running" || isProcessAlive(inMemory.pid))) {
+          continue;
+        }
+        const fullPath = path.join(JOBS_STORE_DIR, entry);
+        try {
+          const stat = await fs.stat(fullPath);
+          if (now - stat.mtimeMs > JOB_RETENTION_MS) {
+            const raw = await fs.readFile(fullPath, "utf8").catch(() => "");
+            if (raw) {
+              try {
+                const snap = JSON.parse(raw) as PersistedJobSnapshot;
+                if (snap.status === "running" && isProcessAlive(snap.pid)) {
+                  continue;
+                }
+              } catch {
+                // Continua para remocao se o JSON estiver corrompido.
+              }
+            }
+            await fs.unlink(fullPath);
+          }
+        } catch {
+          // Ignora arquivos ja removidos.
+        }
+      }
+    })
+    .catch(() => undefined);
 }
 
 function startBackgroundJob(command: string, cwd: string, timeoutMs: number): BackgroundJob {
@@ -171,9 +487,12 @@ function startBackgroundJob(command: string, cwd: string, timeoutMs: number): Ba
   const id = randomUUID();
   const maxBuffer = configuredPositiveNumber("MCP_COMMAND_MAX_BUFFER_BYTES", DEFAULT_COMMAND_MAX_BUFFER_BYTES);
   let killTimer: NodeJS.Timeout | undefined;
+  let exitDrainTimer: NodeJS.Timeout | undefined;
+  let finalized = false;
 
   const child = spawn("/bin/bash", ["-c", command], {
     cwd,
+    env: buildCommandEnv(cwd),
     detached: process.platform !== "win32",
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -188,6 +507,7 @@ function startBackgroundJob(command: string, cwd: string, timeoutMs: number): Ba
     exitCode: null,
     stdoutChunks: [],
     stderrChunks: [],
+    stderrOffsetByStdoutOffset: new Map([[0, 0]]),
     capturedBytes: 0,
     timedOut: false,
     maxBufferExceeded: false,
@@ -205,7 +525,7 @@ function startBackgroundJob(command: string, cwd: string, timeoutMs: number): Ba
   };
 
   const capture = (chunks: Buffer[], chunk: Buffer): void => {
-    if (job.maxBufferExceeded) return;
+    if (job.maxBufferExceeded || finalized) return;
     const remaining = maxBuffer - job.capturedBytes;
     if (remaining <= 0) {
       job.maxBufferExceeded = true;
@@ -235,11 +555,21 @@ function startBackgroundJob(command: string, cwd: string, timeoutMs: number): Ba
   }, timeoutMs);
   timeoutTimer.unref();
 
-  child.on("close", (code, signal) => {
+  const finalizeJob = (code: number | null, signal: NodeJS.Signals | null): void => {
+    if (finalized) return;
+    finalized = true;
     clearTimeout(timeoutTimer);
     if (killTimer) clearTimeout(killTimer);
+    if (exitDrainTimer) clearTimeout(exitDrainTimer);
     if (job.timedOut || job.maxBufferExceeded || job.killedByUser) {
       killProcessGroup(child.pid, "SIGKILL");
+    }
+    try {
+      child.stdout.destroy();
+      child.stderr.destroy();
+      child.unref();
+    } catch {
+      // Ignora erro ao destruir pipes ja fechados.
     }
     job.finishedAtMs = Date.now();
     if (job.killedByUser) {
@@ -258,97 +588,397 @@ function startBackgroundJob(command: string, cwd: string, timeoutMs: number): Ba
         job.errorMessage = `Processo encerrado por sinal ${signal}.`;
       }
     }
+    void persistJobSnapshot(job);
     for (const notify of job.waiters) notify();
     job.waiters.clear();
+  };
+
+  child.on("exit", (code, signal) => {
+    if (!finalized && !exitDrainTimer) {
+      exitDrainTimer = setTimeout(() => finalizeJob(code, signal), EXIT_PIPE_DRAIN_GRACE_MS);
+      exitDrainTimer.unref();
+    }
   });
 
+  child.on("close", (code, signal) => finalizeJob(code, signal));
+
   backgroundJobs.set(id, job);
+  void persistJobSnapshot(job);
   return job;
+}
+
+interface RedirectedFileInfo {
+  filePath: string;
+  sizeBytes: number;
+  mtimeMs: number;
+  tailPreview: string;
+  hasStreamJsonResult: boolean;
+}
+
+function extractRedirectedFiles(command: string, cwd: string): string[] {
+  const regex = /(?:^|[\s;|&()])(?:[12]?>>?|[&]>>?)\s*(?:"([^"]+)"|'([^']+)'|([^\s;|&><()'"]+))/g;
+  const seen = new Set<string>();
+  let match: RegExpExecArray | null;
+  while ((match = regex.exec(command)) !== null) {
+    const rawTarget = (match[1] ?? match[2] ?? match[3] ?? "").trim();
+    if (!rawTarget || rawTarget.startsWith("&") || rawTarget === "/dev/null" || /[$`*?[\]{}]/.test(rawTarget)) {
+      continue;
+    }
+    const resolved = rawTarget.startsWith("~/")
+      ? path.join(os.homedir(), rawTarget.slice(2))
+      : path.isAbsolute(rawTarget)
+        ? path.normalize(rawTarget)
+        : path.resolve(cwd, rawTarget);
+    seen.add(resolved);
+    if (seen.size >= 4) break;
+  }
+  return Array.from(seen);
+}
+
+async function inspectRedirectedFiles(job: BackgroundJob): Promise<RedirectedFileInfo[]> {
+  const targets = extractRedirectedFiles(job.command, job.cwd);
+  if (targets.length === 0) return [];
+  const results: RedirectedFileInfo[] = [];
+  for (const filePath of targets) {
+    try {
+      const st = await fs.stat(filePath);
+      if (!st.isFile()) continue;
+      if (st.mtimeMs < job.startedAtMs - 2_000 && st.ctimeMs < job.startedAtMs - 2_000) continue;
+      let tailText = "";
+      if (st.size > 0) {
+        const readLen = Math.min(st.size, 8_192);
+        const readPos = Math.max(0, st.size - readLen);
+        const handle = await fs.open(filePath, "r");
+        try {
+          const buf = Buffer.allocUnsafe(readLen);
+          const { bytesRead } = await handle.read(buf, 0, readLen, readPos);
+          const slice = buf.subarray(0, bytesRead);
+          if (!slice.includes(0)) {
+            tailText = slice.toString("utf8");
+          }
+        } finally {
+          await handle.close();
+        }
+      }
+      const hasStreamJsonResult = /"event"\s*:\s*"result"/.test(tailText);
+      let tailPreview = tailText.trim();
+      if (tailPreview.length > 1_200) {
+        tailPreview = `...(truncado)...\n${tailPreview.slice(-1_200)}`;
+      }
+      results.push({
+        filePath,
+        sizeBytes: st.size,
+        mtimeMs: st.mtimeMs,
+        tailPreview,
+        hasStreamJsonResult,
+      });
+    } catch {
+      // Ignora arquivos ainda nao criados ou inacessiveis.
+    }
+  }
+  return results;
 }
 
 function waitForJob(job: BackgroundJob, waitMs: number): Promise<void> {
   if (job.status !== "running" || waitMs <= 0) return Promise.resolve();
   return new Promise((resolve) => {
-    const onDone = () => {
+    let livenessInterval: NodeJS.Timeout | undefined;
+    let streamCheckInterval: NodeJS.Timeout | undefined;
+    const cleanup = () => {
       clearTimeout(timer);
+      if (livenessInterval) clearInterval(livenessInterval);
+      if (streamCheckInterval) clearInterval(streamCheckInterval);
       job.waiters.delete(onDone);
+    };
+    const onDone = () => {
+      cleanup();
       resolve();
     };
     const timer = setTimeout(() => {
-      job.waiters.delete(onDone);
+      cleanup();
       resolve();
     }, waitMs);
     timer.unref();
+    if (job.recoveredFromDisk) {
+      livenessInterval = setInterval(() => {
+        if (!isProcessAlive(job.pid)) {
+          job.status = "completed";
+          job.exitCode = job.exitCode ?? "0 (recovered_after_restart)";
+          job.finishedAtMs = job.finishedAtMs ?? Date.now();
+          void persistJobSnapshot(job);
+          onDone();
+        }
+      }, 500);
+      livenessInterval.unref();
+    }
+    const hasRedirections = extractRedirectedFiles(job.command, job.cwd).length > 0;
+    if (!job.streamJsonResultNotified && waitMs >= 1_500 && (hasRedirections || job.command.includes("stream-json"))) {
+      streamCheckInterval = setInterval(() => {
+        if (job.status !== "running" || job.streamJsonResultNotified) return;
+        void inspectRedirectedFiles(job)
+          .then((infos) => {
+            if (job.status !== "running" || job.streamJsonResultNotified) return;
+            const ready = infos.some((info) => info.hasStreamJsonResult && Date.now() - info.mtimeMs >= 1_500);
+            if (ready) {
+              job.streamJsonResultNotified = true;
+              onDone();
+            }
+          })
+          .catch(() => undefined);
+      }, 750);
+      streamCheckInterval.unref();
+    }
     job.waiters.add(onDone);
   });
 }
 
-async function formatJobResult(job: BackgroundJob, stdoutOffset = 0): Promise<CallToolResult> {
+function compactRepeatedWatchFrames(text: string): { text: string; compactedFrames: number } {
+  const markerRegex = /Refreshing (?:run|checks) status every \d+ seconds\. Press Ctrl\+C to quit\./g;
+  const matches = Array.from(text.matchAll(markerRegex));
+  if (matches.length <= 1) {
+    return { text, compactedFrames: 0 };
+  }
+  const firstIndex = matches[0].index ?? 0;
+  const lastIndex = matches[matches.length - 1].index ?? 0;
+  const prefix = text.slice(0, firstIndex).trimEnd();
+  const latestFrame = text.slice(lastIndex);
+  const compactedFrames = matches.length - 1;
+  const summaryLine = `[... ${compactedFrames} frames intermediarios repetidos de 'gh watch' omitidos; exibindo apenas o snapshot mais recente ...]`;
+  const combined = prefix
+    ? `${prefix}\n\n${summaryLine}\n${latestFrame}`
+    : `${summaryLine}\n${latestFrame}`;
+  return { text: combined, compactedFrames };
+}
+
+function resolveStderrOffsetForStdoutOffset(job: BackgroundJob, safeStdoutOffset: number): number {
+  if (safeStdoutOffset < 0) return 0;
+  const exact = job.stderrOffsetByStdoutOffset.get(safeStdoutOffset);
+  if (exact !== undefined) return exact;
+  let bestStdout = 0;
+  let bestStderr = 0;
+  for (const [outOff, errOff] of job.stderrOffsetByStdoutOffset.entries()) {
+    if (outOff <= safeStdoutOffset && outOff >= bestStdout) {
+      bestStdout = outOff;
+      bestStderr = errOff;
+    }
+  }
+  return bestStderr;
+}
+
+function uuidHammingDistance(a: string, b: string): number {
+  if (a.length !== b.length) return 999;
+  let dist = 0;
+  for (let i = 0; i < a.length; i += 1) {
+    if (a[i] !== b[i]) dist += 1;
+  }
+  return dist;
+}
+
+async function resolveJobWithTypoTolerance(
+  requestedId: string,
+): Promise<{ job?: BackgroundJob; autoCorrectedFrom?: string; activeJobsHint: string }> {
+  const exact = backgroundJobs.get(requestedId) ?? (await loadPersistedJob(requestedId));
+  if (exact) {
+    return { job: exact, activeJobsHint: "" };
+  }
+  const normReq = requestedId.toLowerCase();
+  try {
+    const entries = await fs.readdir(JOBS_STORE_DIR);
+    for (const entry of entries) {
+      if (!entry.endsWith(".json")) continue;
+      const diskId = entry.slice(0, -5);
+      if (!backgroundJobs.has(diskId)) {
+        await loadPersistedJob(diskId);
+      }
+    }
+  } catch {
+    // Ignora se diretorio ainda nao existir.
+  }
+
+  let bestJob: BackgroundJob | undefined;
+  let bestDist = 999;
+  let ties = 0;
+  for (const candidate of backgroundJobs.values()) {
+    const dist = uuidHammingDistance(normReq, candidate.id.toLowerCase());
+    if (dist < bestDist) {
+      bestDist = dist;
+      bestJob = candidate;
+      ties = 1;
+    } else if (dist === bestDist) {
+      ties += 1;
+    }
+  }
+
+  if (bestJob && bestDist <= 2 && ties === 1) {
+    return { job: bestJob, autoCorrectedFrom: requestedId, activeJobsHint: "" };
+  }
+
+  const recentJobs = Array.from(backgroundJobs.values())
+    .sort((a, b) => {
+      const aRun = a.status === "running" ? 1 : 0;
+      const bRun = b.status === "running" ? 1 : 0;
+      if (bRun !== aRun) return bRun - aRun;
+      return b.startedAtMs - a.startedAtMs;
+    })
+    .slice(0, 5);
+
+  const activeJobsHint =
+    recentJobs.length > 0
+      ? ` Jobs recentes disponiveis: ${recentJobs
+          .map((j) => `${j.id} (status=${j.status}, cmd="${j.command.replace(/\s+/g, " ").slice(0, 60)}")`)
+          .join("; ")}.`
+      : "";
+
+  return { job: undefined, activeJobsHint };
+}
+
+async function formatJobResult(
+  job: BackgroundJob,
+  stdoutOffset = 0,
+  explicitStderrOffset?: number,
+  autoCorrectedFrom?: string,
+): Promise<CallToolResult> {
   const fullStdout = Buffer.concat(job.stdoutChunks).toString("utf8");
   const fullStderr = Buffer.concat(job.stderrChunks).toString("utf8");
   const safeOffset = Math.min(Math.max(0, stdoutOffset), fullStdout.length);
-  const slicedStdout = fullStdout.slice(safeOffset);
+  const rawSlicedStdout = fullStdout.slice(safeOffset);
+  const { text: slicedStdout, compactedFrames } = compactRepeatedWatchFrames(rawSlicedStdout);
+
+  const inferredStderrOffset =
+    explicitStderrOffset !== undefined
+      ? explicitStderrOffset
+      : resolveStderrOffsetForStdoutOffset(job, safeOffset);
+  const safeStderrOffset = Math.min(Math.max(0, inferredStderrOffset), fullStderr.length);
+  const slicedStderr = fullStderr.slice(safeStderrOffset);
+
+  job.stderrOffsetByStdoutOffset.set(fullStdout.length, fullStderr.length);
+  job.lastReturnedStderrOffset = fullStderr.length;
+  void persistJobSnapshot(job);
+
   const elapsedMs = (job.finishedAtMs ?? Date.now()) - job.startedAtMs;
+  const processAlive = job.status === "running" ? isProcessAlive(job.pid) : false;
+  const isLongCommand =
+    elapsedMs >= 20_000 ||
+    /\b(agy|codex|vitest|playwright|gh\s+(?:run\s+watch|pr\s+checks\b.*--watch)|npm\s+run\s+(?:build|guard|lint)|npm\s+(?:test|ci))\b/i.test(
+      job.command,
+    );
+  const suggestedWaitMs = isLongCommand ? 120_000 : 60_000;
+  const offsetHint =
+    fullStderr.length > 0 && fullStdout.length === 0
+      ? `offset=0, stderr_offset=${fullStderr.length}`
+      : `offset=${fullStdout.length}`;
+
+  const redirectedInfos = await inspectRedirectedFiles(job);
+  const redirectedSummary =
+    redirectedInfos.length > 0
+      ? `redirected_output_files: ${redirectedInfos.map((r) => `${r.filePath} (${r.sizeBytes} bytes)`).join(", ")}`
+      : "";
+  const hasStreamJsonResult =
+    redirectedInfos.some((r) => r.hasStreamJsonResult) || /"event"\s*:\s*"result"/.test(fullStdout.slice(-4_000));
+  const streamJsonStatus =
+    hasStreamJsonResult && job.status === "running"
+      ? "stream_json_status: result_ready (evento final {\"event\":\"result\"} ja foi gravado; o processo continua aberto — voce ja pode ler o resultado final ou encerrar o job com kill_command)"
+      : "";
+  let redirectedPreviewSection = "";
+  if (!slicedStdout && redirectedInfos.some((r) => r.tailPreview.length > 0)) {
+    const blocks = redirectedInfos
+      .filter((r) => r.tailPreview.length > 0)
+      .map((r) => `[${r.filePath} (${r.sizeBytes} bytes)]:\n${r.tailPreview}`);
+    redirectedPreviewSection = `redirected_output_preview:\n${blocks.join("\n\n")}`;
+  }
+
+  let stderrSection = "";
+  if (slicedStderr) {
+    stderrSection = `stderr:\n${slicedStderr}`;
+  } else if (job.status !== "running" && job.exitCode !== 0 && fullStderr) {
+    const tailStderr = fullStderr.length > 4_000 ? `...(truncado)...\n${fullStderr.slice(-4_000)}` : fullStderr;
+    stderrSection = `stderr (resumo final do erro):\n${tailStderr}`;
+  }
+
   const parts = [
     `job_id: ${job.id}`,
+    autoCorrectedFrom ? `job_id_autocorrected_from: ${autoCorrectedFrom}` : "",
     `status: ${job.status}`,
     job.exitCode !== null
       ? `exit_code: ${job.exitCode}${job.timedOut ? " (timeout; grupo de processos encerrado)" : ""}`
       : "exit_code: running",
     `pid: ${job.pid ?? "desconhecido"}`,
+    `process_alive: ${processAlive}`,
     `elapsed_ms: ${elapsedMs}`,
     `stdout_offset: ${safeOffset}`,
     `next_offset: ${fullStdout.length}`,
     `total_stdout_chars: ${fullStdout.length}`,
-    job.status === "running" && fullStdout.length > 0
-      ? `poll_hint: passe offset=${fullStdout.length} no proximo poll_command para ler apenas novas linhas de stdout`
+    fullStderr.length > 0 ? `stderr_offset: ${safeStderrOffset}` : "",
+    fullStderr.length > 0 ? `next_stderr_offset: ${fullStderr.length}` : "",
+    fullStderr.length > 0 ? `total_stderr_chars: ${fullStderr.length}` : "",
+    compactedFrames > 0 ? `compacted_watch_frames: ${compactedFrames}` : "",
+    redirectedSummary,
+    streamJsonStatus,
+    job.status === "running"
+      ? `poll_hint: passe ${offsetHint} e wait_ms=${suggestedWaitMs} (ate 180000) no proximo poll_command (job_id="${job.id}") para ler apenas novas linhas de stdout/stderr sem polling excessivo`
       : "",
     job.maxBufferExceeded
       ? `output_limit_exceeded: true (MCP_COMMAND_MAX_BUFFER_BYTES=${configuredPositiveNumber("MCP_COMMAND_MAX_BUFFER_BYTES", DEFAULT_COMMAND_MAX_BUFFER_BYTES)})`
       : "",
     slicedStdout ? `stdout:\n${slicedStdout}` : "stdout: (vazio)",
-    fullStderr ? `stderr:\n${fullStderr}` : "",
+    redirectedPreviewSection,
+    stderrSection,
     job.errorMessage ? `error_message:\n${job.errorMessage}` : "",
   ].filter(Boolean);
   return commandResult(parts.join("\n"));
 }
 
-function executeRipgrep(rgArgs: string[], cwd: string, timeoutMs = 30_000): Promise<CommandExecution> {
+function executeRipgrep(
+  rgArgs: string[],
+  cwd: string,
+  timeoutMs = 30_000,
+  maxLines?: number,
+): Promise<CommandExecution> {
   return new Promise((resolve) => {
     let timedOut = false;
     let maxBufferExceeded = false;
+    let earlyLineLimitReached = false;
     let spawnError: string | undefined;
     const maxBuffer = configuredPositiveNumber("MCP_COMMAND_MAX_BUFFER_BYTES", DEFAULT_COMMAND_MAX_BUFFER_BYTES);
     const stdoutChunks: Buffer[] = [];
     const stderrChunks: Buffer[] = [];
     let capturedBytes = 0;
+    let capturedNewlines = 0;
 
     const child = spawn("rg", rgArgs, {
       cwd,
       stdio: ["ignore", "pipe", "pipe"],
     });
 
-    const capture = (chunks: Buffer[], chunk: Buffer): void => {
-      if (maxBufferExceeded) return;
+    const capture = (chunks: Buffer[], chunk: Buffer, isStdout = false): void => {
+      if (maxBufferExceeded || earlyLineLimitReached) return;
       const remaining = maxBuffer - capturedBytes;
       if (remaining <= 0) {
         maxBufferExceeded = true;
         child.kill("SIGTERM");
         return;
       }
-      if (chunk.length <= remaining) {
-        chunks.push(chunk);
-        capturedBytes += chunk.length;
+      const slice = chunk.length <= remaining ? chunk : chunk.subarray(0, remaining);
+      chunks.push(slice);
+      capturedBytes += slice.length;
+      if (chunk.length > remaining) {
+        maxBufferExceeded = true;
+        child.kill("SIGTERM");
         return;
       }
-      chunks.push(chunk.subarray(0, remaining));
-      capturedBytes += remaining;
-      maxBufferExceeded = true;
-      child.kill("SIGTERM");
+      if (isStdout && maxLines !== undefined && maxLines > 0) {
+        for (let i = 0; i < slice.length; i += 1) {
+          if (slice[i] === 0x0a) capturedNewlines += 1;
+        }
+        if (capturedNewlines >= maxLines) {
+          earlyLineLimitReached = true;
+          child.kill("SIGTERM");
+        }
+      }
     };
 
-    child.stdout.on("data", (chunk: Buffer) => capture(stdoutChunks, chunk));
-    child.stderr.on("data", (chunk: Buffer) => capture(stderrChunks, chunk));
+    child.stdout.on("data", (chunk: Buffer) => capture(stdoutChunks, chunk, true));
+    child.stderr.on("data", (chunk: Buffer) => capture(stderrChunks, chunk, false));
     child.on("error", (err) => {
       spawnError = err.message;
     });
@@ -362,7 +992,13 @@ function executeRipgrep(rgArgs: string[], cwd: string, timeoutMs = 30_000): Prom
     child.on("close", (code) => {
       clearTimeout(timeoutTimer);
       resolve({
-        exitCode: timedOut ? "timeout" : maxBufferExceeded ? "output_limit" : code ?? "desconhecido",
+        exitCode: earlyLineLimitReached
+          ? 0
+          : timedOut
+            ? "timeout"
+            : maxBufferExceeded
+              ? "output_limit"
+              : code ?? "desconhecido",
         stdout: Buffer.concat(stdoutChunks).toString("utf8"),
         stderr: Buffer.concat(stderrChunks).toString("utf8"),
         timedOut,
@@ -491,58 +1127,215 @@ function findOccurrenceLines(text: string, sub: string, maxLocations = 10): numb
   return lines;
 }
 
-/** Quando old_string nao e encontrado exatamente, procura uma linha parecida para orientar a correcao. */
-function buildMissingOldStringHint(content: string, oldStr: string): string {
-  const oldLines = oldStr
-    .split("\n")
-    .map((l) => l.trim())
-    .filter((l) => l.length >= 4);
-  if (oldLines.length === 0) return "";
-  // Escolhe a primeira linha relevante ou a mais longa entre as 3 primeiras para evitar ancoras triviais como "}".
-  const candidate = oldLines.slice(0, 3).sort((a, b) => b.length - a.length)[0];
-  if (!candidate || candidate.length < 4) return "";
+const SNIPPET_LINE_MAX_CHARS = 2_000;
 
+function formatSnippetLine(line: string): string {
+  return line.length > SNIPPET_LINE_MAX_CHARS
+    ? `${line.slice(0, SNIPPET_LINE_MAX_CHARS)}...(truncado)`
+    : line;
+}
+
+/** Exibe linhas vizinhas ao redor das primeiras ocorrencias para facilitar a desambiguacao imediata sem read_file extra. */
+function buildMultipleOccurrencesHint(content: string, lineNums: number[], oldLineCount: number): string {
+  if (lineNums.length === 0) return "";
   const fileLines = content.split("\n");
-  const candidateLower = candidate.toLowerCase();
-  let matchIdx = fileLines.findIndex((line) => line.includes(candidate));
-  if (matchIdx === -1) {
-    matchIdx = fileLines.findIndex((line) => line.toLowerCase().includes(candidateLower));
+  const blocks: string[] = [];
+  for (const ln of lineNums.slice(0, 3)) {
+    const idx = ln - 1;
+    const start = Math.max(0, idx - 2);
+    const end = Math.min(fileLines.length, idx + Math.min(oldLineCount, 4) + 2);
+    const snippet = fileLines
+      .slice(start, end)
+      .map((line, i) => `  ${start + i + 1} | ${formatSnippetLine(line)}`)
+      .join("\n");
+    blocks.push(snippet);
   }
-  // Fallback 1: prefixo inicial da linha (util quando old_string e uma unica linha longa com divergencia no meio/fim).
-  if (matchIdx === -1 && candidateLower.length >= 12) {
-    const prefixLen = Math.min(32, Math.max(10, Math.floor(candidateLower.length * 0.4)));
-    const prefix = candidateLower.slice(0, prefixLen);
-    matchIdx = fileLines.findIndex((line) => line.toLowerCase().includes(prefix));
-  }
-  // Fallback 2: linha com maior sobreposicao de palavras/tokens significativos (>= 4 chars).
-  if (matchIdx === -1) {
-    const tokens = Array.from(new Set(oldStr.toLowerCase().match(/[a-z0-9_\u00C0-\u017F]{4,}/g) ?? [])).slice(0, 24);
-    if (tokens.length >= 2) {
-      const minRequired = Math.max(2, Math.ceil(tokens.length * 0.35));
-      let bestScore = 0;
-      let bestLine = -1;
-      for (let i = 0; i < fileLines.length; i++) {
-        const lower = fileLines[i].toLowerCase();
-        if (lower.length < 4) continue;
-        let score = 0;
-        for (const tk of tokens) {
-          if (lower.includes(tk)) score += 1;
-        }
-        if (score >= minRequired && score > bestScore) {
-          bestScore = score;
-          bestLine = i;
-        }
-      }
-      matchIdx = bestLine;
+  return `\nContexto das primeiras ocorrencias:\n${blocks.join("\n  ---\n")}`;
+}
+
+/**
+ * Quando old_string nao casa exatamente por diferenca de quebra de linha (CRLF vs LF)
+ * ou espacos em branco invisiveis no fim da linha, localiza o trecho equivalente se (e somente se) for unico no arquivo.
+ */
+function findNormalizedUniqueMatch(content: string, oldStr: string): { index: number; length: number } | null {
+  if (!oldStr) return null;
+  if (content.includes("\r\n") && !oldStr.includes("\r\n")) {
+    const crlfOld = oldStr.replace(/\n/g, "\r\n");
+    const crlfOcc = countOccurrences(content, crlfOld);
+    if (crlfOcc.count === 1) {
+      return { index: crlfOcc.firstIndex, length: crlfOld.length };
     }
   }
+  if (oldStr.includes("\n") && content.length <= 2_000_000) {
+    const rawLines = oldStr.split(/\r?\n/);
+    if (rawLines.length >= 2 && rawLines.length <= 80) {
+      const pattern = rawLines
+        .map((line) => `${line.replace(/[ \t]+$/, "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}[ \\t]*\\r?`)
+        .join("\\n");
+      const re = new RegExp(pattern, "g");
+      const first = re.exec(content);
+      if (first && !re.exec(content)) {
+        return { index: first.index, length: first[0].length };
+      }
+    }
+  }
+  return null;
+}
+
+/** Quando old_string nao e encontrado exatamente, procura uma linha parecida para orientar a correcao. */
+function buildMissingOldStringHint(content: string, oldStr: string): string {
+  const rawOldLines = oldStr.split("\n");
+  const indexedOldLines = rawOldLines
+    .map((raw, idx) => ({ trimmed: raw.trim(), idx }))
+    .filter((item) => item.trimmed.length >= 4);
+  if (indexedOldLines.length === 0) return "";
+
+  const oldLines = indexedOldLines.map((item) => item.trimmed);
+  const fileLines = content.split("\n");
+
+  const rawTokens = Array.from(new Set(oldStr.match(/[A-Za-z0-9_\u00C0-\u017F-]{3,}/g) ?? [])).slice(0, 36);
+  const tokenSpecs = rawTokens.map((raw) => {
+    const lower = raw.toLowerCase();
+    const isDistinctive =
+      /[A-Z]/.test(raw.slice(1)) || /[0-9_-]/.test(raw) || raw.length >= 9;
+    return { lower, weight: isDistinctive ? 3 : raw.length >= 4 ? 1 : 0.5, isDistinctive };
+  });
+
+  const scoreWindowAt = (startLineIdx: number): { score: number; distinctiveHits: number } => {
+    const winStart = Math.max(0, startLineIdx - 2);
+    const winEnd = Math.min(fileLines.length, startLineIdx + Math.min(rawOldLines.length + 3, 10));
+    const winText = fileLines.slice(winStart, winEnd).join("\n").toLowerCase();
+    let score = 0;
+    let distinctiveHits = 0;
+    for (const tk of tokenSpecs) {
+      if (winText.includes(tk.lower)) {
+        score += tk.weight;
+        if (tk.isDistinctive) distinctiveHits += 1;
+      }
+    }
+    for (const ol of oldLines.slice(0, 8)) {
+      if (winText.includes(ol.toLowerCase())) {
+        score += 2.5;
+      }
+    }
+    return { score, distinctiveHits };
+  };
+
+  let matchIdx = -1;
+  let step1BestScore = 0;
+  let step1FoundUnique = false;
+
+  // Passo 1: avalia linhas candidatas de old_string priorizando linhas unicas/raras e maior sobreposicao de janela.
+  const candidates = [...indexedOldLines.slice(0, 12)].sort((a, b) => b.trimmed.length - a.trimmed.length);
+  for (const candObj of candidates) {
+    const cand = candObj.trimmed;
+    if (cand.length < 4) continue;
+    const candLower = cand.toLowerCase();
+    const matchingIndices: number[] = [];
+    for (let i = 0; i < fileLines.length; i += 1) {
+      if (fileLines[i].includes(cand) || fileLines[i].toLowerCase().includes(candLower)) {
+        matchingIndices.push(i);
+        if (matchingIndices.length >= 40) break;
+      }
+    }
+    if (matchingIndices.length === 0) continue;
+
+    const rarityWeight = matchingIndices.length === 1 ? 18 : 6 / Math.sqrt(matchingIndices.length);
+    for (const fileIdx of matchingIndices) {
+      const estStart = rawOldLines.length > 1 ? Math.max(0, fileIdx - candObj.idx) : fileIdx;
+      const win = scoreWindowAt(estStart);
+      const totalCandidateScore = rarityWeight + win.score;
+      if (totalCandidateScore > step1BestScore) {
+        step1BestScore = totalCandidateScore;
+        matchIdx = estStart;
+        step1FoundUnique = matchingIndices.length === 1;
+      }
+    }
+  }
+
+  // Passo 2: ancora estrutural de propriedade/chave (ex.: sidebarDescription=, subtitle=, | **R1 — ...)
+  if (matchIdx === -1) {
+    for (const lineObj of indexedOldLines.slice(0, 5)) {
+      const lineText = lineObj.trimmed;
+      const propMatch =
+        lineText.match(/^([a-zA-Z_$][a-zA-Z0-9_$-]{2,}\s*[:=])/) ??
+        lineText.match(/^(\|\s*\*\*[^|]{2,40}\*\*)/) ??
+        lineText.match(/^((?:it|test|describe)\s*\(\s*['"`][^'"`]{4,35})/);
+      if (propMatch) {
+        const anchorLower = propMatch[1].toLowerCase();
+        const matchingIndices: number[] = [];
+        for (let i = 0; i < fileLines.length; i += 1) {
+          if (fileLines[i].toLowerCase().includes(anchorLower)) {
+            matchingIndices.push(i);
+          }
+        }
+        if (matchingIndices.length === 1) {
+          matchIdx = Math.max(0, matchingIndices[0] - lineObj.idx);
+          step1FoundUnique = true;
+          break;
+        }
+      }
+    }
+  }
+
+  // Passo 3: pontuacao ponderada por identificadores, numeros e estrutura (suporta janelas multi-linha).
+  // Tambem executa quando o Passo 1 so encontrou uma linha generica repetida (ex.: 'status: EXECUTING')
+  // para que blocos com tokens distintivos (ex.: 'WP-PLAN-005') tenham prioridade.
+  if ((matchIdx === -1 || !step1FoundUnique) && tokenSpecs.length >= 1) {
+    const bulletPrefix = oldLines[0].match(/^([-*+]|\d+\.|\|)\s+/)?.[0];
+    const windowLines = Math.min(Math.max(1, oldLines.length), 4);
+
+    let bestScore = 0;
+    let bestLine = -1;
+    let bestDistinctiveHits = 0;
+    for (let i = 0; i < fileLines.length; i += 1) {
+      const firstLineTrim = fileLines[i].trimStart();
+      if (firstLineTrim.length < 3) continue;
+      const windowText =
+        windowLines > 1
+          ? fileLines.slice(i, Math.min(fileLines.length, i + windowLines)).join("\n").toLowerCase()
+          : firstLineTrim.toLowerCase();
+      let rawScore = 0;
+      let distinctiveHits = 0;
+      let totalHits = 0;
+      for (const tk of tokenSpecs) {
+        if (windowText.includes(tk.lower)) {
+          rawScore += tk.weight;
+          totalHits += 1;
+          if (tk.isDistinctive) distinctiveHits += 1;
+        }
+      }
+      if (distinctiveHits === 0 && totalHits < 2) continue;
+      if (bulletPrefix && firstLineTrim.startsWith(bulletPrefix)) {
+        rawScore *= 1.35;
+      }
+      const lengthNorm = Math.pow(Math.max(60, windowText.length), 0.15);
+      const finalScore = rawScore / lengthNorm;
+      if (finalScore > bestScore) {
+        bestScore = finalScore;
+        bestLine = i;
+        bestDistinctiveHits = distinctiveHits;
+      }
+    }
+    if (bestLine !== -1) {
+      if (matchIdx === -1) {
+        matchIdx = bestLine;
+      } else {
+        const step1Win = scoreWindowAt(matchIdx);
+        if (bestDistinctiveHits > step1Win.distinctiveHits) {
+          matchIdx = bestLine;
+        }
+      }
+    }
+  }
+
   if (matchIdx === -1) return "";
 
   const start = Math.max(0, matchIdx - 2);
-  const end = Math.min(fileLines.length, matchIdx + Math.min(oldStr.split("\n").length + 2, 7));
+  const end = Math.min(fileLines.length, matchIdx + Math.min(rawOldLines.length + 4, 12));
   const snippet = fileLines
     .slice(start, end)
-    .map((line, i) => `  ${start + i + 1} | ${line.slice(0, 500)}`)
+    .map((line, i) => `  ${start + i + 1} | ${formatSnippetLine(line)}`)
     .join("\n");
   return `\nTrecho similar encontrado proximo a linha ${matchIdx + 1}:\n${snippet}`;
 }
@@ -587,7 +1380,43 @@ function matchesFindTerm(relPath: string, term: string, caseSensitive: boolean):
   return re.test(relPath) || re.test(path.basename(relPath));
 }
 
-/** Valida que o caminho existe e, em caso de ENOENT, informa o diretorio pai existente mais proximo e suas entradas. */
+const STRUCTURAL_HINT_SUBDIRS = [
+  "services",
+  "packages",
+  "apps",
+  "modules",
+  "criaelo",
+  "criaelo/services",
+  "criaelo/packages",
+  "criaelo/apps",
+  "work",
+  "src",
+];
+
+/**
+ * Quando o agente passa um glob ao final de `path` (ex.: `/dir/scripts/crm-p1-*.test.mjs`),
+ * separa automaticamente o diretorio base existente do sufixo glob, evitando erro ENOENT.
+ */
+function resolveTargetAndTrailingGlob(rawPath: string | undefined): { target: string; extractedGlob?: string } {
+  if (!rawPath) return { target: os.homedir() };
+  const resolved = resolvePath(rawPath);
+  if (existsSync(resolved)) {
+    return { target: resolved };
+  }
+  if (!/[*?{]/.test(resolved)) {
+    return { target: resolved };
+  }
+  const segments = resolved.split(path.sep);
+  const firstGlobIdx = segments.findIndex((seg) => /[*?{]/.test(seg));
+  if (firstGlobIdx <= 0) {
+    return { target: resolved };
+  }
+  const baseDir = segments.slice(0, firstGlobIdx).join(path.sep) || path.sep;
+  const extractedGlob = segments.slice(firstGlobIdx).join("/");
+  return { target: baseDir, extractedGlob };
+}
+
+/** Valida que o caminho existe e, em caso de ENOENT, informa o diretorio pai existente mais proximo, caminhos alternativos e entradas similares. */
 async function assertTargetExistsWithHint(target: string, toolName: string) {
   try {
     return await fs.stat(target);
@@ -598,14 +1427,70 @@ async function assertTargetExistsWithHint(target: string, toolName: string) {
         try {
           const pStat = await fs.stat(parent);
           if (pStat.isDirectory()) {
-            const entries = (await fs.readdir(parent, { withFileTypes: true }))
-              .filter((e) => !DEFAULT_SEARCH_IGNORE_DIRS.includes(e.name))
-              .sort((a, b) => entryCollator.compare(a.name, b.name))
-              .slice(0, 15)
-              .map((e) => (e.isDirectory() ? `${e.name}/` : e.name));
+            const relMissing = path.relative(parent, target);
+            const missingChild = relMissing.split(path.sep)[0] || path.basename(target);
+            const missingRemainder =
+              relMissing.length > missingChild.length ? relMissing.slice(missingChild.length + 1) : "";
+            const missingLower = missingChild.toLowerCase();
+            const tokens = missingLower.split(/[-_.\s/]+/).filter((t) => t.length >= 2);
+
+            const candidates: string[] = [];
+            for (const sub of STRUCTURAL_HINT_SUBDIRS) {
+              const fullCandidate = path.join(parent, sub, relMissing);
+              if (existsSync(fullCandidate)) {
+                candidates.push(fullCandidate);
+              } else if (missingRemainder) {
+                const baseCandidate = path.join(parent, sub, missingChild);
+                if (existsSync(baseCandidate)) {
+                  candidates.push(baseCandidate);
+                }
+              }
+            }
+
+            const dirents = (await fs.readdir(parent, { withFileTypes: true })).filter(
+              (e) => !DEFAULT_SEARCH_IGNORE_DIRS.includes(e.name),
+            );
+
+            const scored = dirents.map((e) => {
+              const nameLower = e.name.toLowerCase();
+              let score = 0;
+              if (nameLower === missingLower) score += 100;
+              else if (
+                nameLower.includes(missingLower) ||
+                (missingLower.length >= 3 && missingLower.includes(nameLower))
+              ) {
+                score += 50;
+              }
+              for (const tk of tokens) {
+                if (nameLower.includes(tk)) score += 10;
+              }
+              if (score >= 20 && missingRemainder && e.isDirectory()) {
+                const subCandidate = path.join(parent, e.name, missingRemainder);
+                if (existsSync(subCandidate)) {
+                  score += 80;
+                  if (candidates.length < 3) candidates.push(subCandidate);
+                }
+              }
+              return { dirent: e, score };
+            });
+
+            scored.sort((a, b) => {
+              if (b.score !== a.score) return b.score - a.score;
+              const aDir = a.dirent.isDirectory() ? 1 : 0;
+              const bDir = b.dirent.isDirectory() ? 1 : 0;
+              if (bDir !== aDir) return bDir - aDir;
+              return entryCollator.compare(a.dirent.name, b.dirent.name);
+            });
+
+            const entries = scored
+              .slice(0, 25)
+              .map(({ dirent }) => (dirent.isDirectory() ? `${dirent.name}/` : dirent.name));
+            const uniqueCandidates = Array.from(new Set(candidates)).slice(0, 3);
+            const suggestionHint =
+              uniqueCandidates.length > 0 ? ` Sugestao encontrada: ${uniqueCandidates.join(", ")}.` : "";
             const hint = entries.length > 0 ? ` Entradas disponiveis em ${parent}: ${entries.join(", ")}.` : "";
             throw new Error(
-              `Caminho inexistente em ${toolName}: ${target}. Diretorio pai existente mais proximo: ${parent}.${hint}`,
+              `Caminho inexistente em ${toolName}: ${target}. Diretorio pai existente mais proximo: ${parent}.${suggestionHint}${hint}`,
             );
           }
         } catch (parentErr) {
@@ -630,6 +1515,14 @@ function buildSearchIgnoreGlobs(target: string, userGlobs: string[]): string[] {
     const explicitlyReferenced = userGlobs.some((g) => g.includes(ignoreDir));
     if (!targetInsideDir && !explicitlyReferenced) {
       args.push(`--glob=!**/${ignoreDir}/**`);
+    }
+  }
+  // Ignora diretorios de dados binarios do PostgreSQL em worktrees, a menos que apontados explicitamente.
+  const pgIgnorePatterns = ["pg_wal", "pg_multixact", "pg_xact", "postgres-*/data", "*pgdata*"];
+  for (const pgPat of pgIgnorePatterns) {
+    const baseToken = pgPat.replace(/[*\/]/g, "");
+    if (!target.includes(baseToken) && !userGlobs.some((g) => g.includes(baseToken))) {
+      args.push(`--glob=!**/${pgPat}/**`);
     }
   }
   // Evita varrer /root/repos/work (centenas de worktrees/logs) quando a busca parte de /root/repos ou home.
@@ -659,7 +1552,7 @@ async function readSingleFileFormatted(params: FileSliceParams): Promise<string>
     throw new Error("Use paginacao por linhas (offset/limit) OU por caracteres (char_offset/char_limit), nao ambas na mesma chamada.");
   }
 
-  const stat = await fs.stat(target);
+  const stat = await assertTargetExistsWithHint(target, "read_file");
   if (!stat.isFile()) {
     throw new Error(`O caminho nao e um arquivo regular: ${target}`);
   }
@@ -835,9 +1728,9 @@ export const tools: ToolDef[] = [
     name: "start_command",
     title: "Iniciar comando em background",
     description:
-      "Inicia um comando de shell (bash) em background com job_id e aguarda opcionalmente wait_ms (padrao 2000ms). " +
-      "Use SEMPRE para builds, deploys, suites de teste (Playwright, Vitest), gh run watch, pipelines encadeados (lint && build && test) ou invocacao de subagentes CLI (agy) sem travar a chamada HTTP. " +
-      "Se retornar status: running, chame poll_command passando o job_id e offset=next_offset para acompanhar apenas a saida nova.",
+      "Inicia um comando de shell (bash) em background com job_id e aguarda opcionalmente wait_ms (padrao 10000ms, max 120000ms). " +
+      "Use SEMPRE para builds, deploys, suites de teste (Playwright, Vitest), gh run watch (prefira 'gh run watch <id> --interval 15'), pipelines encadeados (lint && build && test) ou invocacao de subagentes CLI (agy) sem travar a chamada HTTP. " +
+      "Se retornar status: running, chame poll_command passando job_id, offset=next_offset e wait_ms=60000..180000 para acompanhar apenas a saida nova sem polling excessivo.",
     schema: {
       command: z.string().describe("Comando de shell completo a executar em background."),
       cwd: z.string().optional().describe("Diretorio de trabalho para o comando. Padrao: diretorio home."),
@@ -845,16 +1738,16 @@ export const tools: ToolDef[] = [
         .number()
         .int()
         .positive()
-        .max(1_800_000)
+        .max(3_600_000)
         .optional()
-        .describe("Timeout total do job em milissegundos (max 1800000 / 30 min). Padrao: 600000 (10 min)."),
+        .describe("Timeout total do job em milissegundos (max 3600000 / 60 min). Padrao: 1200000 (20 min)."),
       wait_ms: z
         .number()
         .int()
         .min(0)
-        .max(30_000)
+        .max(120_000)
         .optional()
-        .describe("Tempo inicial de espera em ms antes de retornar se o comando ainda estiver rodando. Padrao: 2000."),
+        .describe("Tempo inicial de espera em ms antes de retornar se o comando ainda estiver rodando (max 120000). Padrao: 10000 (valores entre 1000 e 9999 sao elevados para 10000ms automaticamente, retornando imediatamente assim que o comando concluir)."),
     },
     handler: async (args) => {
       const command = args.command as string;
@@ -863,8 +1756,9 @@ export const tools: ToolDef[] = [
       if (!cwdStat.isDirectory()) {
         throw new Error(`O diretorio de trabalho (cwd) informado em start_command nao e um diretorio: ${cwd}`);
       }
-      const timeoutMs = (args.timeout_ms as number | undefined) ?? 600_000;
-      const waitMs = (args.wait_ms as number | undefined) ?? 2_000;
+      const timeoutMs = (args.timeout_ms as number | undefined) ?? 1_200_000;
+      const requestedWaitMs = (args.wait_ms as number | undefined) ?? 10_000;
+      const waitMs = requestedWaitMs >= 1_000 && requestedWaitMs < 10_000 ? 10_000 : requestedWaitMs;
       const job = startBackgroundJob(command, cwd, timeoutMs);
       await waitForJob(job, waitMs);
       return formatJobResult(job, 0);
@@ -876,23 +1770,29 @@ export const tools: ToolDef[] = [
     title: "Consultar ou encerrar comando em background",
     description:
       "Consulta o status e a saida incremental (stdout/stderr) de um job iniciado por start_command, " +
-      "aguardando ate wait_ms pela conclusao, ou encerra todo o grupo de processos se kill=true. " +
-      "BOAS PRATICAS: passe sempre offset com o valor de next_offset retornado na chamada anterior para ler apenas novas linhas e evitar repetir logs.",
+      "aguardando ate wait_ms pela conclusao (padrao 60000ms, max 180000ms), ou encerra todo o grupo de processos se kill=true. " +
+      "BOAS PRATICAS: passe sempre offset com o valor de next_offset retornado na chamada anterior (o stderr tambem sera fatiado incrementalmente de forma automatica) e use wait_ms entre 60000 e 180000 para jobs longos (retorna imediatamente assim que o job concluir).",
     schema: {
       job_id: z.string().uuid().describe("ID do job retornado por start_command."),
       wait_ms: z
         .number()
         .int()
         .min(0)
-        .max(60_000)
+        .max(180_000)
         .optional()
-        .describe("Tempo maximo de espera por conclusao nesta chamada em ms (max 60000). Padrao: 5000."),
+        .describe("Tempo maximo de espera por conclusao nesta chamada em ms (max 180000 / 3 min). Padrao: 60000 (1 min)."),
       offset: z
         .number()
         .int()
         .nonnegative()
         .optional()
-        .describe("Offset em caracteres do stdout. Passe SEMPRE o next_offset retornado no poll anterior para receber apenas saida nova. Padrao: 0."),
+        .describe("Offset em caracteres do stdout. Passe SEMPRE o next_offset retornado no poll anterior para receber apenas saida nova (stdout e stderr). Padrao: 0."),
+      stderr_offset: z
+        .number()
+        .int()
+        .nonnegative()
+        .optional()
+        .describe("Offset explicito em caracteres do stderr (opcional; se omitido, acompanha automaticamente o avanco de offset)."),
       kill: z
         .boolean()
         .optional()
@@ -900,20 +1800,25 @@ export const tools: ToolDef[] = [
     },
     handler: async (args) => {
       const jobId = args.job_id as string;
-      const job = backgroundJobs.get(jobId);
+      const { job, autoCorrectedFrom, activeJobsHint } = await resolveJobWithTypoTolerance(jobId);
       if (!job) {
-        throw new Error(`Job nao encontrado ou expirado: ${jobId}`);
+        throw new Error(`Job nao encontrado ou expirado: ${jobId}.${activeJobsHint}`);
       }
       const kill = (args.kill as boolean | undefined) ?? false;
       const offset = (args.offset as number | undefined) ?? 0;
-      if (kill && job.status === "running") {
-        job.terminate(true);
-        await waitForJob(job, 2_000);
+      const stderrOffset = args.stderr_offset as number | undefined;
+      if (kill) {
+        if (job.status === "running") {
+          job.terminate(true);
+          await waitForJob(job, 2_000);
+        } else {
+          killProcessGroup(job.pid, "SIGTERM");
+        }
       } else {
-        const waitMs = (args.wait_ms as number | undefined) ?? 5_000;
+        const waitMs = (args.wait_ms as number | undefined) ?? 60_000;
         await waitForJob(job, waitMs);
       }
-      return formatJobResult(job, offset);
+      return formatJobResult(job, offset, stderrOffset, autoCorrectedFrom);
     },
   },
 
@@ -1025,6 +1930,13 @@ export const tools: ToolDef[] = [
         .max(20)
         .optional()
         .describe("Numero de linhas de contexto antes e depois de cada match (-C). Padrao: 0."),
+      max_depth: z
+        .number()
+        .int()
+        .min(1)
+        .max(15)
+        .optional()
+        .describe("Profundidade maxima opcional de subdiretorios a percorrer."),
       max_results: z
         .number()
         .int()
@@ -1035,24 +1947,31 @@ export const tools: ToolDef[] = [
     },
     handler: async (args) => {
       const pattern = args.pattern as string;
-      const target = args.path ? resolvePath(args.path as string) : os.homedir();
-      const globs = (args.globs as string[] | undefined) ?? [];
+      const { target, extractedGlob } = resolveTargetAndTrailingGlob(args.path as string | undefined);
+      const globs = [...((args.globs as string[] | undefined) ?? []), ...(extractedGlob ? [extractedGlob] : [])];
       const fixedStrings = (args.fixed_strings as boolean | undefined) ?? false;
       const caseSensitive = args.case_sensitive as boolean | undefined;
       const hidden = (args.hidden as boolean | undefined) ?? false;
       const contextLines = (args.context_lines as number | undefined) ?? 0;
+      const explicitMaxDepth = args.max_depth as number | undefined;
+      const maxDepth = explicitMaxDepth ?? (target === "/root/repos/work" ? 3 : undefined);
       const maxResults = (args.max_results as number | undefined) ?? 200;
 
       await assertTargetExistsWithHint(target, "search_code");
 
       const ignoreArgs = buildSearchIgnoreGlobs(target, globs);
+      const earlyStopLines = contextLines === 0 ? maxResults + 500 : undefined;
       const buildRgArgs = (useFixedStrings: boolean): string[] => {
         const rgArgs: string[] = [
           "--line-number",
           "--with-filename",
           "--color=never",
           "--no-heading",
+          "--max-filesize=2M",
         ];
+        if (maxDepth !== undefined) {
+          rgArgs.push(`--max-depth=${maxDepth}`);
+        }
         if (useFixedStrings) rgArgs.push("--fixed-strings");
         if (caseSensitive === true) rgArgs.push("--case-sensitive");
         else if (caseSensitive === false) rgArgs.push("--ignore-case");
@@ -1071,13 +1990,13 @@ export const tools: ToolDef[] = [
         return rgArgs;
       };
 
-      let execution = await executeRipgrep(buildRgArgs(fixedStrings), os.homedir());
+      let execution = await executeRipgrep(buildRgArgs(fixedStrings), os.homedir(), 30_000, earlyStopLines);
       let usedFallbackFixedStrings = false;
 
       // Se o agente esqueceu fixed_strings=true ao buscar codigo com parenteses/chaves (ex.: "Inter(", "icons: {"),
       // faz fallback automatico para --fixed-strings em vez de falhar com regex parse error.
       if (!fixedStrings && execution.exitCode === 2 && /regex parse error/i.test(execution.stderr)) {
-        execution = await executeRipgrep(buildRgArgs(true), os.homedir());
+        execution = await executeRipgrep(buildRgArgs(true), os.homedir(), 30_000, earlyStopLines);
         usedFallbackFixedStrings = true;
       }
 
@@ -1093,6 +2012,7 @@ export const tools: ToolDef[] = [
           [
             `exit_code: 0`,
             `path: ${target}`,
+            ...(extractedGlob ? [`extracted_glob: ${extractedGlob}`] : []),
             `pattern: ${pattern}`,
             `mode: ${modeLabel}`,
             `matches: 0`,
@@ -1103,24 +2023,29 @@ export const tools: ToolDef[] = [
         );
       }
 
-      if (execution.exitCode !== 0 && execution.exitCode !== 1) {
+      const hasPartialTimeoutMatches = execution.timedOut && execution.stdout.trim().length > 0;
+      if (execution.exitCode !== 0 && execution.exitCode !== 1 && !hasPartialTimeoutMatches) {
         const errText = execution.stderr.trim() || execution.errorMessage || `ripgrep falhou com codigo ${execution.exitCode}`;
         throw new Error(`Erro ao executar search_code (rg): ${errText}`);
       }
 
       const rawLines = execution.stdout.replace(/\r?\n$/, "");
       const lines = rawLines ? rawLines.split("\n") : [];
-      const truncated = lines.length > maxResults;
-      const selectedLines = truncated ? lines.slice(0, maxResults) : lines;
+      const truncated = lines.length > maxResults || hasPartialTimeoutMatches;
+      const selectedLines = lines.length > maxResults ? lines.slice(0, maxResults) : lines;
 
       const header = [
         `exit_code: 0`,
         `path: ${target}`,
+        extractedGlob ? `extracted_glob: ${extractedGlob}` : "",
         `pattern: ${pattern}`,
         `mode: ${modeLabel}`,
         `returned_lines: ${selectedLines.length}`,
         `total_lines: ${lines.length}`,
         `truncated: ${truncated}`,
+        hasPartialTimeoutMatches
+          ? "timed_out_partial: true (busca atingiu 30s em diretorio grande; exibindo resultados parciais encontrados)"
+          : "",
         execution.stderr.trim() ? `warnings: ${execution.stderr.trim()}` : "",
       ]
         .filter(Boolean)
@@ -1177,10 +2102,15 @@ export const tools: ToolDef[] = [
         .describe("Quantidade maxima de arquivos a retornar. Padrao: 200."),
     },
     handler: async (args) => {
-      const rawPattern = (args.pattern as string | undefined)?.trim();
-      const target = args.path ? resolvePath(args.path as string) : os.homedir();
-      const globs = (args.globs as string[] | undefined) ?? [];
-      const maxDepth = args.max_depth as number | undefined;
+      const { target, extractedGlob } = resolveTargetAndTrailingGlob(args.path as string | undefined);
+      const explicitPattern = (args.pattern as string | undefined)?.trim();
+      const rawPattern = explicitPattern || extractedGlob;
+      const globs = [
+        ...((args.globs as string[] | undefined) ?? []),
+        ...(explicitPattern && extractedGlob ? [extractedGlob] : []),
+      ];
+      const explicitMaxDepth = args.max_depth as number | undefined;
+      const maxDepth = explicitMaxDepth ?? (target === "/root/repos/work" ? 3 : undefined);
       const caseSensitive = (args.case_sensitive as boolean | undefined) ?? false;
       const hidden = (args.hidden as boolean | undefined) ?? true;
       const maxResults = (args.max_results as number | undefined) ?? 200;
@@ -1202,7 +2132,8 @@ export const tools: ToolDef[] = [
       }
 
       const patternTerms = rawPattern ? splitPatternAlternation(rawPattern) : [];
-      const allTermsAreGlobs = patternTerms.length > 0 && patternTerms.every((t) => /[*?[\]{}]/.test(t));
+      const allTermsAreStrictGlobs = patternTerms.length > 0 && patternTerms.every((t) => /[*?[\]{}]/.test(t));
+      const canPushPatternToRg = patternTerms.length > 0 && patternTerms.every((t) => !t.startsWith("!"));
 
       const rgArgs: string[] = ["--files", "--color=never"];
       if (hidden) {
@@ -1215,10 +2146,28 @@ export const tools: ToolDef[] = [
       for (const glob of globs) {
         rgArgs.push(`--glob=${glob}`);
       }
-      if (allTermsAreGlobs) {
+      if (canPushPatternToRg) {
+        const flag = caseSensitive ? "--glob" : "--iglob";
         for (const term of patternTerms) {
-          const normalizedGlob = normalizeFindGlob(term);
-          rgArgs.push(`${caseSensitive ? "--glob" : "--iglob"}=${normalizedGlob}`);
+          const hasGlob = /[*?[\]{}]/.test(term);
+          if (hasGlob) {
+            const normalizedGlob = normalizeFindGlob(term);
+            rgArgs.push(`${flag}=${normalizedGlob}`);
+            if (!term.includes("/") && term.startsWith("*") && term.endsWith("*")) {
+              rgArgs.push(`${flag}=**/${normalizedGlob}/**`);
+            }
+          } else {
+            const clean = term.replace(/^\/+|\/+$/g, "");
+            if (clean) {
+              if (clean.includes("/")) {
+                rgArgs.push(`${flag}=**/*${clean}*`);
+                rgArgs.push(`${flag}=**/*${clean}*/**`);
+              } else {
+                rgArgs.push(`${flag}=*${clean}*`);
+                rgArgs.push(`${flag}=**/*${clean}*/**`);
+              }
+            }
+          }
         }
       }
       rgArgs.push("--", target);
@@ -1233,7 +2182,7 @@ export const tools: ToolDef[] = [
       const rawLines = execution.stdout.replace(/\r?\n$/, "");
       let files = rawLines ? rawLines.split("\n") : [];
 
-      if (patternTerms.length > 0 && !allTermsAreGlobs) {
+      if (patternTerms.length > 0 && !allTermsAreStrictGlobs) {
         files = files.filter((filePath) => {
           const rel = filePath.startsWith(target + path.sep) ? filePath.slice(target.length + 1) : filePath;
           return patternTerms.some((term) => matchesFindTerm(rel, term, caseSensitive));
@@ -1342,14 +2291,23 @@ export const tools: ToolDef[] = [
       const content = await fs.readFile(target, "utf8");
       const { count: occurrences, firstIndex } = countOccurrences(content, oldStr);
       if (occurrences === 0) {
+        if (!replaceAll) {
+          const normalized = findNormalizedUniqueMatch(content, oldStr);
+          if (normalized) {
+            const updatedNormalized = `${content.slice(0, normalized.index)}${newStr}${content.slice(normalized.index + normalized.length)}`;
+            await fs.writeFile(target, updatedNormalized, "utf8");
+            return textResult(`Arquivo editado: ${target} (1 substituicao(oes)).`);
+          }
+        }
         const hint = buildMissingOldStringHint(content, oldStr);
         throw new Error(`old_string nao encontrado em ${target}.${hint}`);
       }
       if (occurrences > 1 && !replaceAll) {
         const lineNums = findOccurrenceLines(content, oldStr);
         const linesLabel = lineNums.length > 0 ? ` (linhas ${lineNums.join(", ")}${occurrences > lineNums.length ? ", ..." : ""})` : "";
+        const contextHint = buildMultipleOccurrencesHint(content, lineNums, countLines(oldStr));
         throw new Error(
-          `old_string aparece ${occurrences} vezes em ${target}${linesLabel}. Inclua linhas vizinhas para torna-lo unico ou use replace_all=true.`,
+          `old_string aparece ${occurrences} vezes em ${target}${linesLabel}. Inclua linhas vizinhas para torna-lo unico ou use replace_all=true.${contextHint}`,
         );
       }
       const updated = replaceAll
@@ -1389,18 +2347,49 @@ export const tools: ToolDef[] = [
 
       for (let i = 0; i < edits.length; i += 1) {
         const edit = edits[i];
+        if (edit.old_string === edit.new_string) {
+          continue;
+        }
         const replaceAll = edit.replace_all ?? false;
+        const editPrefix = i > 0 ? `Edicao #${i + 1} (edicoes #1..#${i} validadas OK)` : `Edicao #${i + 1}`;
         const { count: occurrences, firstIndex } = countOccurrences(updated, edit.old_string);
         if (occurrences === 0) {
+          const alreadyAppliedInBatch =
+            i > 0 &&
+            edits
+              .slice(0, i)
+              .some((prev) => prev.old_string === edit.old_string && prev.new_string === edit.new_string);
+          if (alreadyAppliedInBatch) {
+            continue;
+          }
+          if (!replaceAll) {
+            const normalized = findNormalizedUniqueMatch(updated, edit.old_string);
+            if (normalized) {
+              updated = `${updated.slice(0, normalized.index)}${edit.new_string}${updated.slice(normalized.index + normalized.length)}`;
+              totalReplacements += 1;
+              continue;
+            }
+          }
           const hint = buildMissingOldStringHint(updated, edit.old_string);
-          throw new Error(`Edicao #${i + 1}: old_string nao encontrado em ${target}. Nenhuma alteracao foi gravada.${hint}`);
+          throw new Error(`${editPrefix}: old_string nao encontrado em ${target}. Nenhuma alteracao foi gravada.${hint}`);
         }
         if (occurrences > 1 && !replaceAll) {
-          const lineNums = findOccurrenceLines(updated, edit.old_string);
-          const linesLabel = lineNums.length > 0 ? ` (linhas ${lineNums.join(", ")}${occurrences > lineNums.length ? ", ..." : ""})` : "";
-          throw new Error(
-            `Edicao #${i + 1}: old_string aparece ${occurrences} vezes em ${target}${linesLabel}. Inclua linhas vizinhas para torna-lo unico ou use replace_all=true. Nenhuma alteracao foi gravada.`,
-          );
+          const remainingSameOldStringEdits = edits
+            .slice(i)
+            .filter(
+              (candidate) =>
+                !candidate.replace_all &&
+                candidate.old_string === edit.old_string &&
+                candidate.old_string !== candidate.new_string,
+            ).length;
+          if (remainingSameOldStringEdits !== occurrences) {
+            const lineNums = findOccurrenceLines(updated, edit.old_string);
+            const linesLabel = lineNums.length > 0 ? ` (linhas ${lineNums.join(", ")}${occurrences > lineNums.length ? ", ..." : ""})` : "";
+            const contextHint = buildMultipleOccurrencesHint(updated, lineNums, countLines(edit.old_string));
+            throw new Error(
+              `${editPrefix}: old_string aparece ${occurrences} vezes em ${target}${linesLabel}. Inclua linhas vizinhas para torna-lo unico ou use replace_all=true. Nenhuma alteracao foi gravada.${contextHint}`,
+            );
+          }
         }
         updated = replaceAll
           ? updated.replaceAll(edit.old_string, edit.new_string)
@@ -1419,11 +2408,17 @@ export const tools: ToolDef[] = [
     name: "list_directory",
     title: "Listar diretorio",
     description:
-      "Lista arquivos e subdiretorios com paginacao e profundidade opcional (max_depth de 1 a 4). " +
+      "Lista arquivos e subdiretorios com paginacao, filtro opcional pattern (substring/glob com '|') e profundidade opcional (max_depth de 1 a 4). " +
       "Em max_depth > 1, ignora automaticamente node_modules, .git, .next, dist, build e coverage. " +
-      "DICA: para localizar arquivos por nome ou extensao em toda a arvore, prefira find_files.",
+      "DICA: use pattern (ex.: pattern='*inbox*|*media*' ou pattern='crm-api') para filtrar diretorios grandes como /root/repos/work instantaneamente; para localizar arquivos em toda a arvore, prefira find_files.",
     schema: {
       path: z.string().optional().describe("Diretorio a listar. Padrao: diretorio home."),
+      pattern: z
+        .string()
+        .optional()
+        .describe(
+          "Filtro opcional por nome/caminho das entradas (case-insensitive). Aceita substring ou glob e alternancia com '|' (ex.: 'crm-api', '*inbox*|*media*').",
+        ),
       offset: z.number().int().nonnegative().optional().describe("Indice inicial, base 0. Padrao: 0."),
       limit: z
         .number()
@@ -1441,8 +2436,15 @@ export const tools: ToolDef[] = [
         .describe("Profundidade maxima de listagem recursiva (1 a 4). Padrao: 1."),
     },
     handler: async (args) => {
-      const target = args.path ? resolvePath(args.path as string) : os.homedir();
-      const maxDepth = (args.max_depth as number | undefined) ?? 1;
+      const { target, extractedGlob } = resolveTargetAndTrailingGlob(args.path as string | undefined);
+      const explicitPattern = (args.pattern as string | undefined)?.trim();
+      const rawPattern = explicitPattern || extractedGlob;
+      const patternTerms = rawPattern ? splitPatternAlternation(rawPattern) : [];
+      const inferredDepth =
+        extractedGlob && extractedGlob.includes("/")
+          ? Math.min(4, Math.max(1, extractedGlob.split("/").filter((s) => s && s !== "**").length))
+          : 1;
+      const maxDepth = (args.max_depth as number | undefined) ?? inferredDepth;
       await assertTargetExistsWithHint(target, "list_directory");
 
       interface DirItem {
@@ -1465,7 +2467,12 @@ export const tools: ToolDef[] = [
           }
           const relPath = prefix ? `${prefix}/${e.name}` : e.name;
           const kind: DirItem["kind"] = e.isDirectory() ? "dir " : e.isSymbolicLink() ? "link" : "file";
-          collected.push({ kind, relPath });
+          if (
+            patternTerms.length === 0 ||
+            patternTerms.some((term) => matchesFindTerm(relPath, term, false))
+          ) {
+            collected.push({ kind, relPath });
+          }
           if (e.isDirectory() && depth < maxDepth) {
             try {
               await walk(path.join(currentDir, e.name), relPath, depth + 1);
@@ -1485,6 +2492,7 @@ export const tools: ToolDef[] = [
       const lines = page.map((item) => `${item.kind}  ${item.relPath}`);
       const header = [
         `path: ${target}`,
+        rawPattern ? `pattern: ${rawPattern}` : "",
         maxDepth > 1 ? `max_depth: ${maxDepth}` : "",
         `total: ${collected.length}`,
         `offset: ${offset}`,
@@ -1532,14 +2540,33 @@ export const tools: ToolDef[] = [
   {
     name: "delete_path",
     title: "Excluir arquivo/diretorio",
-    description: "Exclui um arquivo ou diretorio. Para diretorios, use recursive=true. Operacao irreversivel.",
+    description: "Exclui um arquivo ou diretorio. Diretorios vazios sao removidos diretamente; para diretorios nao-vazios, use recursive=true. Operacao irreversivel.",
     schema: {
       path: z.string().describe("Caminho a excluir."),
-      recursive: z.boolean().optional().describe("Excluir diretorio e todo o conteudo. Padrao: false."),
+      recursive: z.boolean().optional().describe("Excluir diretorio e todo o conteudo. Padrao: false (diretorios vazios sao removidos mesmo com recursive=false)."),
     },
     handler: async (args) => {
       const target = resolvePath(args.path as string);
       const recursive = (args.recursive as boolean | undefined) ?? false;
+      if (!recursive) {
+        try {
+          const st = await fs.lstat(target);
+          if (st.isDirectory()) {
+            const entries = await fs.readdir(target);
+            if (entries.length === 0) {
+              await fs.rmdir(target);
+              return textResult(`Excluido: ${target}.`);
+            }
+            throw new Error(
+              `O diretorio ${target} nao esta vazio (${entries.length} entrada(s)). Passe recursive=true em delete_path para excluir o diretorio e seu conteudo.`,
+            );
+          }
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") {
+            throw err;
+          }
+        }
+      }
       await fs.rm(target, { recursive, force: false });
       return textResult(`Excluido: ${target}.`);
     },

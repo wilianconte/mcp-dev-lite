@@ -7,6 +7,7 @@ const MAX_STRING_CHARS = 2_000;
 const MAX_ARRAY_ITEMS = 50;
 const MAX_OBJECT_KEYS = 100;
 const DEFAULT_MAX_AUDIT_FILE_BYTES = 20 * 1024 * 1024;
+export const MCP_SERVER_VERSION = "1.4.6";
 
 function redactSecretsInString(value: string): string {
   return value
@@ -56,6 +57,9 @@ export interface ToolResultSummary {
   content_types: string[];
   text_chars: number;
   image_base64_chars: number;
+  job_id?: string;
+  job_id_autocorrected_from?: string;
+  compacted_watch_frames?: number;
   exit_code?: number | string;
   job_status?: string;
   timed_out?: boolean;
@@ -65,6 +69,9 @@ export interface ToolResultSummary {
 export function summarizeToolResult(result: CallToolResult, includePreview = false): ToolResultSummary {
   let textChars = 0;
   let imageBase64Chars = 0;
+  let jobId: string | undefined;
+  let jobIdAutocorrectedFrom: string | undefined;
+  let compactedWatchFrames: number | undefined;
   let exitCode: number | string | undefined;
   let jobStatus: string | undefined;
   let timedOut = false;
@@ -74,6 +81,24 @@ export function summarizeToolResult(result: CallToolResult, includePreview = fal
     contentTypes.push(item.type);
     if (item.type === "text") {
       textChars += item.text.length;
+      if (jobId === undefined) {
+        const jobMatch = item.text.match(/^job_id:\s*([0-9a-f-]{36})\b/m);
+        if (jobMatch) {
+          jobId = jobMatch[1];
+        }
+      }
+      if (jobIdAutocorrectedFrom === undefined) {
+        const autoMatch = item.text.match(/^job_id_autocorrected_from:\s*(\S+)/m);
+        if (autoMatch) {
+          jobIdAutocorrectedFrom = autoMatch[1];
+        }
+      }
+      if (compactedWatchFrames === undefined) {
+        const framesMatch = item.text.match(/^compacted_watch_frames:\s*(\d+)/m);
+        if (framesMatch) {
+          compactedWatchFrames = Number(framesMatch[1]);
+        }
+      }
       if (jobStatus === undefined) {
         const statusMatch = item.text.match(/^status:\s*(running|completed|timed_out|output_limit|killed)\b/m);
         if (statusMatch) {
@@ -105,6 +130,9 @@ export function summarizeToolResult(result: CallToolResult, includePreview = fal
     content_types: contentTypes,
     text_chars: textChars,
     image_base64_chars: imageBase64Chars,
+    ...(jobId !== undefined ? { job_id: jobId } : {}),
+    ...(jobIdAutocorrectedFrom !== undefined ? { job_id_autocorrected_from: jobIdAutocorrectedFrom } : {}),
+    ...(compactedWatchFrames !== undefined ? { compacted_watch_frames: compactedWatchFrames } : {}),
     ...(exitCode !== undefined ? { exit_code: exitCode } : {}),
     ...(jobStatus !== undefined ? { job_status: jobStatus } : {}),
     ...(timedOut ? { timed_out: true } : {}),
@@ -118,6 +146,7 @@ export function summarizeToolResult(result: CallToolResult, includePreview = fal
 export interface ToolAuditEvent {
   tool: string;
   args: Record<string, unknown>;
+  version?: string;
   sessionId?: string;
   requestId?: string | number;
   clientId?: string;
@@ -152,6 +181,7 @@ export async function auditToolCall(event: ToolAuditEvent): Promise<void> {
   const finishedAtMs = Date.now();
   const record = {
     timestamp: new Date(finishedAtMs).toISOString(),
+    version: event.version ?? MCP_SERVER_VERSION,
     event: "mcp.tool_call",
     tool: event.tool,
     session_id: event.sessionId ?? null,

@@ -96,7 +96,7 @@ test('servidor integra auth, sessoes MCP, auditoria, proxy e OAuth PKCE', { time
   try {
     const health = await waitForHealth(baseUrl, child);
     assert.equal(health.status, 'ok');
-    assert.equal(health.tools.length, 16);
+    assert.equal(health.tools.length, 17);
 
     const unauthorized = await fetch(`${baseUrl}/mcp`, {
       method: 'POST',
@@ -121,7 +121,7 @@ test('servidor integra auth, sessoes MCP, auditoria, proxy e OAuth PKCE', { time
 
     const listed = await mcpPost(baseUrl, staticToken, { jsonrpc: '2.0', id: 3, method: 'tools/list', params: {} }, sessionId);
     assert.equal(listed.response.status, 200, listed.text);
-    assert.equal(listed.body?.result?.tools?.length, 16);
+    assert.equal(listed.body?.result?.tools?.length, 17);
 
     const called = await mcpPost(
       baseUrl,
@@ -262,10 +262,10 @@ test('servidor integra auth, sessoes MCP, auditoria, proxy e OAuth PKCE', { time
     assert.match(logsHtml, /id="tab-panel-kpis"/);
     assert.match(logsHtml, /mcp_monitor_alert_cfg_v1/);
 
-    const kpisRes = await fetch(`${baseUrl}/logs/kpis?window=v1.4.6&compare=v1.4.5`);
+    const kpisRes = await fetch(`${baseUrl}/logs/kpis?window=v1.4.7&compare=v1.4.6`);
     assert.equal(kpisRes.status, 200);
     const kpiReport = await kpisRes.json();
-    assert.equal(kpiReport.currentVersion, '1.4.6');
+    assert.equal(kpiReport.currentVersion, '1.4.7');
     assert.ok(kpiReport.current.reliability.totalCalls >= 1);
     assert.equal(kpiReport.current.sampleReadiness.calls.target, 1500);
     assert.equal(kpiReport.current.sampleReadiness.edits.target, 200);

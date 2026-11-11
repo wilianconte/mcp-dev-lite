@@ -749,3 +749,116 @@ test('v1.4.6: multi_edit_file sequencial em blocos repetidos, normalizacao de tr
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test('v1.4.7: normalizacao de indentacao a esquerda, validacao multi-bloco em multi_edit_file, sugestao de typo Levenshtein, stat_path e allow_missing', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'mcp-dev-test-v147-'));
+  try {
+    // 1. Tolerancia a diferenca de indentacao a esquerda (leading whitespace) com ajuste proporcional de new_string
+    const tsFile = path.join(root, 'config.spec.ts');
+    await writeFile(
+      tsFile,
+      [
+        'describe("config", () => {',
+        '  const cfg = {',
+        '      baseUrl: "https://auth.dev.example.test",',
+        '      projectId: "project-dev",',
+        '      organizationId: "org-dev",',
+        '  };',
+        '});',
+      ].join('\n'),
+      'utf8',
+    );
+
+    await tool('edit_file').handler({
+      path: tsFile,
+      old_string: '        organizationId: "org-dev",',
+      new_string: '        organizationId: "org-dev",\n        machineKeyFile: "/var/run/secrets/key.json",',
+    });
+    const afterIndentEdit = await readFile(tsFile, 'utf8');
+    assert.match(afterIndentEdit, /\n      organizationId: "org-dev",\n      machineKeyFile: "\/var\/run\/secrets\/key\.json",/);
+
+    // 1b. Idempotencia: repetir a mesma edicao quando new_string ja esta aplicado no arquivo nao deve falhar
+    const idempRes = await tool('edit_file').handler({
+      path: tsFile,
+      old_string: '      organizationId: "org-dev",',
+      new_string: '      organizationId: "org-dev",\n      machineKeyFile: "/var/run/secrets/key.json",',
+    });
+    assert.match(textOf(idempRes), /idempotente/);
+
+    // 2. multi_edit_file: validacao multi-bloco reportando todos os blocos invalidos de uma vez
+    const statusMd = path.join(root, 'STATUS.md');
+    await writeFile(
+      statusMd,
+      [
+        '# Status',
+        '',
+        '## Bloqueios ativos',
+        '1. **WP-016 — rate limit:** amostra 13:26Z registrou 30/70 CRs.',
+        '',
+        '## Proximas acoes',
+        '1. Revisar e integrar a PR GitOps DEV #1101.',
+      ].join('\n'),
+      'utf8',
+    );
+
+    await assert.rejects(
+      () =>
+        tool('multi_edit_file').handler({
+          path: statusMd,
+          edits: [
+            { old_string: '# Status', new_string: '# Status Atualizado' },
+            { old_string: '1. **WP-016 — rate limit:** amostra 10:00Z antiga.', new_string: '1. **WP-016:** ok.' },
+            { old_string: '4. Revisar e integrar a PR GitOps DEV #9999.', new_string: '1. Integrada.' },
+          ],
+        }),
+      (err) => {
+        assert.match(err.message, /Edicao #2 \(edicoes #1\.\.#1 validadas OK\): old_string nao encontrado/);
+        assert.match(err.message, /Edicao #3: old_string nao encontrado/);
+        assert.match(err.message, /amostra 13:26Z registrou 30\/70 CRs/);
+        assert.match(err.message, /Revisar e integrar a PR GitOps DEV #1101/);
+        return true;
+      },
+    );
+
+    // 3. Sugestao Levenshtein em edit_file quando há typo no caminho (ex.: microk8ks -> microk8s)
+    const k8sDir = path.join(root, '00 - Microk8s');
+    await mkdir(k8sDir, { recursive: true });
+    const k8sScript = path.join(k8sDir, '4 - microk8s-args-apply.sh');
+    await writeFile(k8sScript, '#!/usr/bin/env bash\necho ok\n', 'utf8');
+
+    await assert.rejects(
+      () =>
+        tool('edit_file').handler({
+          path: path.join(root, '00 - Microk8ks', '4 - microk8ks-args-apply.sh'),
+          old_string: 'echo ok',
+          new_string: 'echo done',
+        }),
+      (err) => {
+        assert.match(err.message, /Caminho inexistente em edit_file/);
+        assert.match(err.message, /Sugestao encontrada: .*00 - Microk8s\/4 - microk8s-args-apply\.sh/);
+        return true;
+      },
+    );
+
+    // 4. stat_path em lote e read_file com allow_missing=true (zero erro ENOENT)
+    const statRes = await tool('stat_path').handler({
+      paths: [
+        k8sScript,
+        path.join(root, 'AGENTS.md'),
+        path.join(root, '00 - Microk8ks'),
+      ],
+    });
+    const statText = textOf(statRes);
+    assert.match(statText, /exists: true\ntype: file/);
+    assert.match(statText, /AGENTS\.md\nexists: false\ntype: missing/);
+    assert.match(statText, /suggestions: .*00 - Microk8s/);
+
+    const allowMissingRes = await tool('read_file').handler({
+      path: path.join(root, 'AGENTS.md'),
+      allow_missing: true,
+    });
+    assert.match(textOf(allowMissingRes), /exists: false\nstatus: missing/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

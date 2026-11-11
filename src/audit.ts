@@ -7,7 +7,7 @@ const MAX_STRING_CHARS = 2_000;
 const MAX_ARRAY_ITEMS = 50;
 const MAX_OBJECT_KEYS = 100;
 const DEFAULT_MAX_AUDIT_FILE_BYTES = 20 * 1024 * 1024;
-export const MCP_SERVER_VERSION = "1.4.6";
+export const MCP_SERVER_VERSION = "1.4.7";
 
 function redactSecretsInString(value: string): string {
   return value

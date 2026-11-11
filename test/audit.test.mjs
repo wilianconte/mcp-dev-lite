@@ -153,7 +153,7 @@ test('McpMonitor calcula KPIs qualitativos (Self-Heal, Polling, Higiene e Massa 
     error: new Error('Job nao encontrado ou expirado: 99999999-2222-3333-4444-555555555555.'),
   });
 
-  const report = monitor.getKpiReport('v1.4.6', 'v1.4.5');
+  const report = monitor.getKpiReport('v1.4.7', 'v1.4.6');
   assert.equal(report.current.reliability.totalCalls, 6);
   assert.equal(report.current.reliability.totalErrors, 3);
   assert.equal(report.current.editing.totalEdits, 2);

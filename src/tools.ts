@@ -38,6 +38,17 @@ const DEFAULT_SEARCH_IGNORE_DIRS = [
   ".cache",
   "playwright-report",
   "test-results",
+  ".nvm",
+  ".npm",
+  ".pnpm-store",
+  ".yarn",
+  ".local",
+  ".cargo",
+  ".rustup",
+  ".codex",
+  ".gemini",
+  ".vscode-server",
+  ".cursor-server",
 ];
 
 function textResult(text: string): CallToolResult {
@@ -1154,10 +1165,15 @@ function buildMultipleOccurrencesHint(content: string, lineNums: number[], oldLi
 }
 
 /**
- * Quando old_string nao casa exatamente por diferenca de quebra de linha (CRLF vs LF)
- * ou espacos em branco invisiveis no fim da linha, localiza o trecho equivalente se (e somente se) for unico no arquivo.
+ * Quando old_string nao casa exatamente por diferenca de quebra de linha (CRLF vs LF),
+ * espacos em branco invisiveis no fim da linha ou deslocamento uniforme de indentacao a esquerda,
+ * localiza o trecho equivalente se (e somente se) for unico no arquivo e ajusta a indentacao de newStr quando aplicavel.
  */
-function findNormalizedUniqueMatch(content: string, oldStr: string): { index: number; length: number } | null {
+function findNormalizedUniqueMatch(
+  content: string,
+  oldStr: string,
+  newStr?: string,
+): { index: number; length: number; adjustedNewStr?: string } | null {
   if (!oldStr) return null;
   if (content.includes("\r\n") && !oldStr.includes("\r\n")) {
     const crlfOld = oldStr.replace(/\n/g, "\r\n");
@@ -1176,6 +1192,63 @@ function findNormalizedUniqueMatch(content: string, oldStr: string): { index: nu
       const first = re.exec(content);
       if (first && !re.exec(content)) {
         return { index: first.index, length: first[0].length };
+      }
+    }
+  }
+  // Passo 3 (v1.4.7): tolerancia a diferenca de indentacao horizontal ([ \t]*) quando o trecho e unico no arquivo.
+  const trimmedTotal = oldStr.trim();
+  if (trimmedTotal.length >= 10 && content.length <= 2_000_000) {
+    const rawOldLines = oldStr.split(/\r?\n/);
+    const nonEmptyCount = rawOldLines.filter((l) => l.trim().length > 0).length;
+    if (
+      rawOldLines.length >= 1 &&
+      rawOldLines.length <= 80 &&
+      nonEmptyCount >= 1 &&
+      (rawOldLines.length >= 2 || /^[ \t]+/.test(oldStr))
+    ) {
+      const linePatterns = rawOldLines.map((line) => {
+        const t = line.trim();
+        if (!t) return "[ \\t]*\\r?";
+        return `[ \\t]*${t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}[ \\t]*\\r?`;
+      });
+      const fullPattern = `(?:^|\\n)(${linePatterns.join("\\n")})(?=\\r?\\n|$)`;
+      const re = new RegExp(fullPattern, "g");
+      const first = re.exec(content);
+      if (first && !re.exec(content)) {
+        const matchedBlock = first[1];
+        const matchIndex = first.index + (first[0].startsWith("\n") ? 1 : 0);
+        let adjustedNewStr: string | undefined;
+        if (newStr !== undefined) {
+          const matchedLines = matchedBlock.split(/\r?\n/);
+          const deltas: number[] = [];
+          let onlySpacesUsed = true;
+          for (let k = 0; k < rawOldLines.length && k < matchedLines.length; k += 1) {
+            if (rawOldLines[k].trim().length === 0) continue;
+            const oldLead = rawOldLines[k].match(/^[ \t]*/)?.[0] ?? "";
+            const fileLead = matchedLines[k].match(/^[ \t]*/)?.[0] ?? "";
+            if (oldLead.includes("\t") || fileLead.includes("\t")) {
+              onlySpacesUsed = false;
+              break;
+            }
+            deltas.push(oldLead.length - fileLead.length);
+          }
+          if (onlySpacesUsed && deltas.length > 0 && deltas.every((d) => d === deltas[0]) && deltas[0] !== 0) {
+            const delta = deltas[0];
+            const rawNewLines = newStr.split("\n");
+            if (delta < 0) {
+              const pad = " ".repeat(-delta);
+              adjustedNewStr = rawNewLines.map((nl) => (nl.trim().length > 0 ? `${pad}${nl}` : nl)).join("\n");
+            } else {
+              const canUnindentAll = rawNewLines.every(
+                (nl) => nl.trim().length === 0 || (nl.match(/^ */)?.[0].length ?? 0) >= delta,
+              );
+              if (canUnindentAll) {
+                adjustedNewStr = rawNewLines.map((nl) => (nl.trim().length > 0 ? nl.slice(delta) : nl)).join("\n");
+              }
+            }
+          }
+        }
+        return { index: matchIndex, length: matchedBlock.length, adjustedNewStr };
       }
     }
   }
@@ -1416,89 +1489,169 @@ function resolveTargetAndTrailingGlob(rawPath: string | undefined): { target: st
   return { target: baseDir, extractedGlob };
 }
 
+function computeBoundedEditDistance(a: string, b: string, maxDist = 3): number {
+  if (a === b) return 0;
+  const la = a.length;
+  const lb = b.length;
+  if (Math.abs(la - lb) > maxDist) return maxDist + 1;
+  const prev = new Array<number>(lb + 1);
+  const curr = new Array<number>(lb + 1);
+  for (let j = 0; j <= lb; j += 1) prev[j] = j;
+  for (let i = 1; i <= la; i += 1) {
+    curr[0] = i;
+    let rowMin = curr[0];
+    const ca = a.charCodeAt(i - 1);
+    for (let j = 1; j <= lb; j += 1) {
+      const cost = ca === b.charCodeAt(j - 1) ? 0 : 1;
+      const val = Math.min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost);
+      curr[j] = val;
+      if (val < rowMin) rowMin = val;
+    }
+    if (rowMin > maxDist) return maxDist + 1;
+    for (let j = 0; j <= lb; j += 1) prev[j] = curr[j];
+  }
+  return prev[lb];
+}
+
+function isCloseTypoOrWorktreeMatch(candidateLower: string, missingLower: string): boolean {
+  if (!candidateLower || !missingLower) return false;
+  if (candidateLower === missingLower) return true;
+  const minLen = Math.min(candidateLower.length, missingLower.length);
+  if (minLen >= 5) {
+    const maxAllowed = minLen >= 14 ? 3 : 2;
+    if (computeBoundedEditDistance(candidateLower, missingLower, maxAllowed) <= maxAllowed) {
+      return true;
+    }
+  }
+  if (
+    missingLower.length >= 8 &&
+    candidateLower.startsWith(`${missingLower}-`) &&
+    /^-\d{6,8}/.test(candidateLower.slice(missingLower.length))
+  ) {
+    return true;
+  }
+  return false;
+}
+
+interface MissingPathDetails {
+  closestParent: string;
+  suggestions: string[];
+  availableEntries: string[];
+}
+
+async function inspectMissingPathDetails(target: string): Promise<MissingPathDetails | null> {
+  let parent = path.dirname(target);
+  while (parent !== path.dirname(parent)) {
+    try {
+      const pStat = await fs.stat(parent);
+      if (pStat.isDirectory()) {
+        const relMissing = path.relative(parent, target);
+        const missingChild = relMissing.split(path.sep)[0] || path.basename(target);
+        const missingRemainder =
+          relMissing.length > missingChild.length ? relMissing.slice(missingChild.length + 1) : "";
+        const missingLower = missingChild.toLowerCase();
+        const tokens = missingLower.split(/[-_.\s/]+/).filter((t) => t.length >= 2);
+
+        const candidates: string[] = [];
+        for (const sub of STRUCTURAL_HINT_SUBDIRS) {
+          const fullCandidate = path.join(parent, sub, relMissing);
+          if (existsSync(fullCandidate)) {
+            candidates.push(fullCandidate);
+          } else if (missingRemainder) {
+            const baseCandidate = path.join(parent, sub, missingChild);
+            if (existsSync(baseCandidate)) {
+              candidates.push(baseCandidate);
+            }
+          }
+        }
+
+        const dirents = (await fs.readdir(parent, { withFileTypes: true })).filter(
+          (e) => !DEFAULT_SEARCH_IGNORE_DIRS.includes(e.name),
+        );
+
+        const scored = dirents.map((e) => {
+          const nameLower = e.name.toLowerCase();
+          let score = 0;
+          const isTypoMatch = isCloseTypoOrWorktreeMatch(nameLower, missingLower);
+          if (nameLower === missingLower) score += 100;
+          else if (isTypoMatch) score += 75;
+          else if (
+            nameLower.includes(missingLower) ||
+            (missingLower.length >= 3 && missingLower.includes(nameLower))
+          ) {
+            score += 50;
+          }
+          for (const tk of tokens) {
+            if (nameLower.includes(tk)) score += 10;
+          }
+          if (!missingRemainder && isTypoMatch && candidates.length < 3) {
+            candidates.push(path.join(parent, e.name));
+          }
+          if (score >= 20 && missingRemainder && e.isDirectory()) {
+            const subCandidate = path.join(parent, e.name, missingRemainder);
+            if (existsSync(subCandidate)) {
+              score += 80;
+              if (candidates.length < 3) candidates.push(subCandidate);
+            } else if (isTypoMatch && !missingRemainder.includes(path.sep)) {
+              try {
+                const subDirents = readdirSync(path.join(parent, e.name));
+                const remLower = missingRemainder.toLowerCase();
+                const closeSub = subDirents.find((sn) => isCloseTypoOrWorktreeMatch(sn.toLowerCase(), remLower));
+                if (closeSub) {
+                  score += 80;
+                  if (candidates.length < 3) candidates.push(path.join(parent, e.name, closeSub));
+                }
+              } catch {
+                // Ignora erro de leitura no subdiretorio candidato.
+              }
+            }
+          }
+          return { dirent: e, score };
+        });
+
+        scored.sort((a, b) => {
+          if (b.score !== a.score) return b.score - a.score;
+          const aDir = a.dirent.isDirectory() ? 1 : 0;
+          const bDir = b.dirent.isDirectory() ? 1 : 0;
+          if (bDir !== aDir) return bDir - aDir;
+          return entryCollator.compare(a.dirent.name, b.dirent.name);
+        });
+
+        const availableEntries = scored
+          .slice(0, 25)
+          .map(({ dirent }) => (dirent.isDirectory() ? `${dirent.name}/` : dirent.name));
+        const suggestions = Array.from(new Set(candidates)).slice(0, 3);
+        return {
+          closestParent: parent,
+          suggestions,
+          availableEntries,
+        };
+      }
+    } catch {
+      // Continua subindo para o diretorio pai.
+    }
+    parent = path.dirname(parent);
+  }
+  return null;
+}
+
 /** Valida que o caminho existe e, em caso de ENOENT, informa o diretorio pai existente mais proximo, caminhos alternativos e entradas similares. */
 async function assertTargetExistsWithHint(target: string, toolName: string) {
   try {
     return await fs.stat(target);
   } catch (err) {
     if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
-      let parent = path.dirname(target);
-      while (parent !== path.dirname(parent)) {
-        try {
-          const pStat = await fs.stat(parent);
-          if (pStat.isDirectory()) {
-            const relMissing = path.relative(parent, target);
-            const missingChild = relMissing.split(path.sep)[0] || path.basename(target);
-            const missingRemainder =
-              relMissing.length > missingChild.length ? relMissing.slice(missingChild.length + 1) : "";
-            const missingLower = missingChild.toLowerCase();
-            const tokens = missingLower.split(/[-_.\s/]+/).filter((t) => t.length >= 2);
-
-            const candidates: string[] = [];
-            for (const sub of STRUCTURAL_HINT_SUBDIRS) {
-              const fullCandidate = path.join(parent, sub, relMissing);
-              if (existsSync(fullCandidate)) {
-                candidates.push(fullCandidate);
-              } else if (missingRemainder) {
-                const baseCandidate = path.join(parent, sub, missingChild);
-                if (existsSync(baseCandidate)) {
-                  candidates.push(baseCandidate);
-                }
-              }
-            }
-
-            const dirents = (await fs.readdir(parent, { withFileTypes: true })).filter(
-              (e) => !DEFAULT_SEARCH_IGNORE_DIRS.includes(e.name),
-            );
-
-            const scored = dirents.map((e) => {
-              const nameLower = e.name.toLowerCase();
-              let score = 0;
-              if (nameLower === missingLower) score += 100;
-              else if (
-                nameLower.includes(missingLower) ||
-                (missingLower.length >= 3 && missingLower.includes(nameLower))
-              ) {
-                score += 50;
-              }
-              for (const tk of tokens) {
-                if (nameLower.includes(tk)) score += 10;
-              }
-              if (score >= 20 && missingRemainder && e.isDirectory()) {
-                const subCandidate = path.join(parent, e.name, missingRemainder);
-                if (existsSync(subCandidate)) {
-                  score += 80;
-                  if (candidates.length < 3) candidates.push(subCandidate);
-                }
-              }
-              return { dirent: e, score };
-            });
-
-            scored.sort((a, b) => {
-              if (b.score !== a.score) return b.score - a.score;
-              const aDir = a.dirent.isDirectory() ? 1 : 0;
-              const bDir = b.dirent.isDirectory() ? 1 : 0;
-              if (bDir !== aDir) return bDir - aDir;
-              return entryCollator.compare(a.dirent.name, b.dirent.name);
-            });
-
-            const entries = scored
-              .slice(0, 25)
-              .map(({ dirent }) => (dirent.isDirectory() ? `${dirent.name}/` : dirent.name));
-            const uniqueCandidates = Array.from(new Set(candidates)).slice(0, 3);
-            const suggestionHint =
-              uniqueCandidates.length > 0 ? ` Sugestao encontrada: ${uniqueCandidates.join(", ")}.` : "";
-            const hint = entries.length > 0 ? ` Entradas disponiveis em ${parent}: ${entries.join(", ")}.` : "";
-            throw new Error(
-              `Caminho inexistente em ${toolName}: ${target}. Diretorio pai existente mais proximo: ${parent}.${suggestionHint}${hint}`,
-            );
-          }
-        } catch (parentErr) {
-          if (parentErr instanceof Error && parentErr.message.startsWith(`Caminho inexistente em ${toolName}:`)) {
-            throw parentErr;
-          }
-        }
-        parent = path.dirname(parent);
+      const details = await inspectMissingPathDetails(target);
+      if (details) {
+        const suggestionHint =
+          details.suggestions.length > 0 ? ` Sugestao encontrada: ${details.suggestions.join(", ")}.` : "";
+        const hint =
+          details.availableEntries.length > 0
+            ? ` Entradas disponiveis em ${details.closestParent}: ${details.availableEntries.join(", ")}.`
+            : "";
+        throw new Error(
+          `Caminho inexistente em ${toolName}: ${target}. Diretorio pai existente mais proximo: ${details.closestParent}.${suggestionHint}${hint}`,
+        );
       }
       throw new Error(`Caminho inexistente em ${toolName}: ${target}.`);
     }
@@ -1542,6 +1695,7 @@ interface FileSliceParams {
   limit?: number;
   char_offset?: number;
   char_limit?: number;
+  allow_missing?: boolean;
 }
 
 async function readSingleFileFormatted(params: FileSliceParams): Promise<string> {
@@ -1552,7 +1706,30 @@ async function readSingleFileFormatted(params: FileSliceParams): Promise<string>
     throw new Error("Use paginacao por linhas (offset/limit) OU por caracteres (char_offset/char_limit), nao ambas na mesma chamada.");
   }
 
-  const stat = await assertTargetExistsWithHint(target, "read_file");
+  let stat: Awaited<ReturnType<typeof fs.stat>>;
+  if (params.allow_missing) {
+    try {
+      stat = await fs.stat(target);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
+        const details = await inspectMissingPathDetails(target);
+        return [
+          `path: ${target}`,
+          `exists: false`,
+          `status: missing`,
+          details ? `closest_parent: ${details.closestParent}` : "",
+          details && details.suggestions.length > 0 ? `suggestions: ${details.suggestions.join(", ")}` : "",
+          "",
+          "(arquivo inexistente — verificado sem erro via allow_missing=true)",
+        ]
+          .filter(Boolean)
+          .join("\n");
+      }
+      throw err;
+    }
+  } else {
+    stat = await assertTargetExistsWithHint(target, "read_file");
+  }
   if (!stat.isFile()) {
     throw new Error(`O caminho nao e um arquivo regular: ${target}`);
   }
@@ -1827,7 +2004,8 @@ export const tools: ToolDef[] = [
     title: "Ler arquivo",
     description:
       "Le um unico arquivo de texto com metadata e paginacao. offset/limit operam por linhas; char_offset/char_limit operam por caracteres e sao uteis para arquivos minificados ou linhas muito longas. " +
-      "DICA: se precisar ler 2 ou mais arquivos (ou 2 ou mais faixas offset/limit diferentes do mesmo arquivo), prefira read_files para ler tudo em paralelo em uma unica chamada.",
+      "DICAS: (1) se precisar ler 2 ou mais arquivos (ou 2 ou mais faixas offset/limit diferentes do mesmo arquivo), prefira read_files para ler tudo em paralelo em uma unica chamada. " +
+      "(2) Se o objetivo for apenas checar se o arquivo existe (ou ler caso exista sem gerar erro ENOENT), passe allow_missing=true ou use stat_path.",
     schema: {
       path: z.string().describe("Caminho do arquivo a ler (absoluto, relativo ou com ~)."),
       offset: z.number().int().nonnegative().optional().describe("Linha inicial (base 1; 0 tambem equivale ao inicio por compatibilidade)."),
@@ -1840,6 +2018,10 @@ export const tools: ToolDef[] = [
         .max(MAX_PREVIEW_CHARS)
         .optional()
         .describe(`Quantidade maxima de caracteres, ate ${MAX_PREVIEW_CHARS}.`),
+      allow_missing: z
+        .boolean()
+        .optional()
+        .describe("Se true, retorna exists: false sem lancar erro caso o arquivo nao exista. Padrao: false."),
     },
     handler: async (args) => {
       const formatted = await readSingleFileFormatted({
@@ -1848,8 +2030,77 @@ export const tools: ToolDef[] = [
         limit: args.limit as number | undefined,
         char_offset: args.char_offset as number | undefined,
         char_limit: args.char_limit as number | undefined,
+        allow_missing: args.allow_missing as boolean | undefined,
       });
       return textResult(formatted);
+    },
+  },
+
+  {
+    name: "stat_path",
+    title: "Verificar existencia e metadados de caminho(s)",
+    description:
+      "Inspeciona rapidamente 1 ou mais caminhos (ate 50 em paralelo via paths) para verificar se existem, seu tipo (file, directory, symlink, missing), tamanho em bytes, mtime e sugestoes de caminhos similares quando ausente — NUNCA falha com erro ENOENT. " +
+      "Use SEMPRE antes de criar arquivos opcionais (ex.: AGENTS.md, workflows, schemas) ou para validar nomes de worktrees/arquivos sem poluir a sessao com erros.",
+    schema: {
+      path: z.string().optional().describe("Caminho unico a verificar (opcional se paths for informado)."),
+      paths: z
+        .array(z.string().min(1))
+        .min(1)
+        .max(50)
+        .optional()
+        .describe("Lista de caminhos (ate 50) para verificar existencia e metadados de uma vez."),
+    },
+    handler: async (args) => {
+      const singlePath = typeof args.path === "string" && args.path.trim() ? [args.path.trim()] : [];
+      const multiPaths = Array.isArray(args.paths) ? (args.paths as string[]).map((p) => p.trim()).filter(Boolean) : [];
+      const rawTargets = Array.from(new Set([...singlePath, ...multiPaths]));
+      if (rawTargets.length === 0) {
+        throw new Error("Informe 'path' ou 'paths' em stat_path.");
+      }
+      const blocks = await Promise.all(
+        rawTargets.map(async (rawTarget) => {
+          const target = resolvePath(rawTarget);
+          try {
+            const lstat = await fs.lstat(target);
+            const stat = lstat.isSymbolicLink() ? await fs.stat(target).catch(() => lstat) : lstat;
+            const kind = lstat.isSymbolicLink()
+              ? stat.isDirectory()
+                ? "symlink->directory"
+                : "symlink->file"
+              : stat.isDirectory()
+                ? "directory"
+                : stat.isFile()
+                  ? "file"
+                  : "other";
+            return [
+              `path: ${target}`,
+              `exists: true`,
+              `type: ${kind}`,
+              `size_bytes: ${stat.size}`,
+              `mtime: ${stat.mtime.toISOString()}`,
+            ].join("\n");
+          } catch (err) {
+            if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
+              const details = await inspectMissingPathDetails(target);
+              return [
+                `path: ${target}`,
+                `exists: false`,
+                `type: missing`,
+                details ? `closest_parent: ${details.closestParent}` : "",
+                details && details.suggestions.length > 0 ? `suggestions: ${details.suggestions.join(", ")}` : "",
+                details && details.availableEntries.length > 0
+                  ? `available_in_parent: ${details.availableEntries.slice(0, 12).join(", ")}`
+                  : "",
+              ]
+                .filter(Boolean)
+                .join("\n");
+            }
+            throw err;
+          }
+        }),
+      );
+      return textResult(blocks.join("\n\n"));
     },
   },
 
@@ -1960,7 +2211,7 @@ export const tools: ToolDef[] = [
       await assertTargetExistsWithHint(target, "search_code");
 
       const ignoreArgs = buildSearchIgnoreGlobs(target, globs);
-      const earlyStopLines = contextLines === 0 ? maxResults + 500 : undefined;
+      const earlyStopLines = (maxResults + 100) * Math.max(1, contextLines * 2 + 2);
       const buildRgArgs = (useFixedStrings: boolean): string[] => {
         const rgArgs: string[] = [
           "--line-number",
@@ -2288,15 +2539,23 @@ export const tools: ToolDef[] = [
       const oldStr = args.old_string as string;
       const newStr = args.new_string as string;
       const replaceAll = (args.replace_all as boolean | undefined) ?? false;
+      const stat = await assertTargetExistsWithHint(target, "edit_file");
+      if (!stat.isFile()) {
+        throw new Error(`O caminho nao e um arquivo regular: ${target}`);
+      }
       const content = await fs.readFile(target, "utf8");
       const { count: occurrences, firstIndex } = countOccurrences(content, oldStr);
       if (occurrences === 0) {
         if (!replaceAll) {
-          const normalized = findNormalizedUniqueMatch(content, oldStr);
+          const normalized = findNormalizedUniqueMatch(content, oldStr, newStr);
           if (normalized) {
-            const updatedNormalized = `${content.slice(0, normalized.index)}${newStr}${content.slice(normalized.index + normalized.length)}`;
+            const replacementStr = normalized.adjustedNewStr ?? newStr;
+            const updatedNormalized = `${content.slice(0, normalized.index)}${replacementStr}${content.slice(normalized.index + normalized.length)}`;
             await fs.writeFile(target, updatedNormalized, "utf8");
             return textResult(`Arquivo editado: ${target} (1 substituicao(oes)).`);
+          }
+          if (newStr.trim().length >= 15 && countOccurrences(content, newStr).count === 1) {
+            return textResult(`Arquivo editado: ${target} (0 substituicoes — new_string ja estava aplicado de forma idempotente).`);
           }
         }
         const hint = buildMissingOldStringHint(content, oldStr);
@@ -2309,6 +2568,16 @@ export const tools: ToolDef[] = [
         throw new Error(
           `old_string aparece ${occurrences} vezes em ${target}${linesLabel}. Inclua linhas vizinhas para torna-lo unico ou use replace_all=true.${contextHint}`,
         );
+      }
+      if (
+        occurrences === 1 &&
+        !replaceAll &&
+        newStr !== oldStr &&
+        newStr.trim().length >= 15 &&
+        newStr.includes(oldStr) &&
+        countOccurrences(content, newStr).count === 1
+      ) {
+        return textResult(`Arquivo editado: ${target} (0 substituicoes — new_string ja estava aplicado de forma idempotente).`);
       }
       const updated = replaceAll
         ? content.replaceAll(oldStr, newStr)
@@ -2342,8 +2611,13 @@ export const tools: ToolDef[] = [
     handler: async (args) => {
       const target = resolvePath(args.path as string);
       const edits = args.edits as Array<{ old_string: string; new_string: string; replace_all?: boolean }>;
+      const stat = await assertTargetExistsWithHint(target, "multi_edit_file");
+      if (!stat.isFile()) {
+        throw new Error(`O caminho nao e um arquivo regular: ${target}`);
+      }
       let updated = await fs.readFile(target, "utf8");
       let totalReplacements = 0;
+      const failures: string[] = [];
 
       for (let i = 0; i < edits.length; i += 1) {
         const edit = edits[i];
@@ -2351,7 +2625,10 @@ export const tools: ToolDef[] = [
           continue;
         }
         const replaceAll = edit.replace_all ?? false;
-        const editPrefix = i > 0 ? `Edicao #${i + 1} (edicoes #1..#${i} validadas OK)` : `Edicao #${i + 1}`;
+        const editPrefix =
+          i > 0 && failures.length === 0
+            ? `Edicao #${i + 1} (edicoes #1..#${i} validadas OK)`
+            : `Edicao #${i + 1}`;
         const { count: occurrences, firstIndex } = countOccurrences(updated, edit.old_string);
         if (occurrences === 0) {
           const alreadyAppliedInBatch =
@@ -2363,15 +2640,22 @@ export const tools: ToolDef[] = [
             continue;
           }
           if (!replaceAll) {
-            const normalized = findNormalizedUniqueMatch(updated, edit.old_string);
+            const normalized = findNormalizedUniqueMatch(updated, edit.old_string, edit.new_string);
             if (normalized) {
-              updated = `${updated.slice(0, normalized.index)}${edit.new_string}${updated.slice(normalized.index + normalized.length)}`;
+              const replacementStr = normalized.adjustedNewStr ?? edit.new_string;
+              updated = `${updated.slice(0, normalized.index)}${replacementStr}${updated.slice(normalized.index + normalized.length)}`;
               totalReplacements += 1;
               continue;
             }
+            if (edit.new_string.trim().length >= 15 && countOccurrences(updated, edit.new_string).count === 1) {
+              continue;
+            }
           }
-          const hint = buildMissingOldStringHint(updated, edit.old_string);
-          throw new Error(`${editPrefix}: old_string nao encontrado em ${target}. Nenhuma alteracao foi gravada.${hint}`);
+          if (failures.length < 4) {
+            const hint = buildMissingOldStringHint(updated, edit.old_string);
+            failures.push(`${editPrefix}: old_string nao encontrado em ${target}. Nenhuma alteracao foi gravada.${hint}`);
+          }
+          continue;
         }
         if (occurrences > 1 && !replaceAll) {
           const remainingSameOldStringEdits = edits
@@ -2383,18 +2667,35 @@ export const tools: ToolDef[] = [
                 candidate.old_string !== candidate.new_string,
             ).length;
           if (remainingSameOldStringEdits !== occurrences) {
-            const lineNums = findOccurrenceLines(updated, edit.old_string);
-            const linesLabel = lineNums.length > 0 ? ` (linhas ${lineNums.join(", ")}${occurrences > lineNums.length ? ", ..." : ""})` : "";
-            const contextHint = buildMultipleOccurrencesHint(updated, lineNums, countLines(edit.old_string));
-            throw new Error(
-              `${editPrefix}: old_string aparece ${occurrences} vezes em ${target}${linesLabel}. Inclua linhas vizinhas para torna-lo unico ou use replace_all=true. Nenhuma alteracao foi gravada.${contextHint}`,
-            );
+            if (failures.length < 4) {
+              const lineNums = findOccurrenceLines(updated, edit.old_string);
+              const linesLabel = lineNums.length > 0 ? ` (linhas ${lineNums.join(", ")}${occurrences > lineNums.length ? ", ..." : ""})` : "";
+              const contextHint = buildMultipleOccurrencesHint(updated, lineNums, countLines(edit.old_string));
+              failures.push(
+                `${editPrefix}: old_string aparece ${occurrences} vezes em ${target}${linesLabel}. Inclua linhas vizinhas para torna-lo unico ou use replace_all=true. Nenhuma alteracao foi gravada.${contextHint}`,
+              );
+            }
+            continue;
           }
+        }
+        if (
+          occurrences === 1 &&
+          !replaceAll &&
+          edit.new_string !== edit.old_string &&
+          edit.new_string.trim().length >= 15 &&
+          edit.new_string.includes(edit.old_string) &&
+          countOccurrences(updated, edit.new_string).count === 1
+        ) {
+          continue;
         }
         updated = replaceAll
           ? updated.replaceAll(edit.old_string, edit.new_string)
           : `${updated.slice(0, firstIndex)}${edit.new_string}${updated.slice(firstIndex + edit.old_string.length)}`;
         totalReplacements += replaceAll ? occurrences : 1;
+      }
+
+      if (failures.length > 0) {
+        throw new Error(failures.join("\n\n"));
       }
 
       await fs.writeFile(target, updated, "utf8");
@@ -2459,6 +2760,15 @@ export const tools: ToolDef[] = [
         const dirents = (await fs.readdir(currentDir, { withFileTypes: true })).sort((a, b) =>
           entryCollator.compare(a.name, b.name),
         );
+        // Em /root/repos/work (milhares de worktrees), quando max_depth > 1 e pattern e informado no nivel 1,
+        // evita entrar recursivamente em worktrees cujo nome nao casa com pattern se ja houver worktrees casando.
+        const pruneTopLevelWorktrees =
+          depth === 1 &&
+          maxDepth > 1 &&
+          patternTerms.length > 0 &&
+          target === "/root/repos/work" &&
+          dirents.some((d) => d.isDirectory() && patternTerms.some((term) => matchesFindTerm(d.name, term, false)));
+
         for (const e of dirents) {
           if (collected.length >= maxCollect) break;
           if (maxDepth > 1 && e.isDirectory()) {
@@ -2467,13 +2777,16 @@ export const tools: ToolDef[] = [
           }
           const relPath = prefix ? `${prefix}/${e.name}` : e.name;
           const kind: DirItem["kind"] = e.isDirectory() ? "dir " : e.isSymbolicLink() ? "link" : "file";
-          if (
+          const matchesEntry =
             patternTerms.length === 0 ||
-            patternTerms.some((term) => matchesFindTerm(relPath, term, false))
-          ) {
+            patternTerms.some((term) => matchesFindTerm(relPath, term, false));
+          if (matchesEntry) {
             collected.push({ kind, relPath });
           }
           if (e.isDirectory() && depth < maxDepth) {
+            if (pruneTopLevelWorktrees && !matchesEntry) {
+              continue;
+            }
             try {
               await walk(path.join(currentDir, e.name), relPath, depth + 1);
             } catch {

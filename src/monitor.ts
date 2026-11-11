@@ -236,6 +236,9 @@ function buildKpiEntryFromAudit(parsed: Record<string, unknown>): KpiCallEntry |
     targetPaths = args.files
       .map((f) => (f && typeof f === "object" && typeof (f as Record<string, unknown>).path === "string" ? String((f as Record<string, unknown>).path) : ""))
       .filter(Boolean);
+  } else if (tool === "stat_path" && Array.isArray(args.paths)) {
+    batchCount = args.paths.length;
+    targetPaths = args.paths.map((p) => (typeof p === "string" ? p : "")).filter(Boolean);
   } else if (tool === "multi_edit_file" && Array.isArray(args.edits)) {
     batchCount = args.edits.length;
   }
@@ -289,6 +292,7 @@ function buildKpiEntryFromAudit(parsed: Record<string, unknown>): KpiCallEntry |
 const LOCAL_NATIVE_TOOLS = new Set([
   "read_file",
   "read_files",
+  "stat_path",
   "search_code",
   "find_files",
   "read_image",
@@ -305,6 +309,7 @@ const LOCAL_NATIVE_TOOLS = new Set([
 const NATIVE_READ_SEARCH_TOOLS = new Set([
   "read_file",
   "read_files",
+  "stat_path",
   "search_code",
   "find_files",
   "list_directory",
@@ -312,8 +317,11 @@ const NATIVE_READ_SEARCH_TOOLS = new Set([
 
 function filterKpiEntriesByWindow(entries: KpiCallEntry[], windowKey: string, nowMs = Date.now()): { list: KpiCallEntry[]; label: string } {
   const norm = (windowKey || `v${MCP_SERVER_VERSION}`).trim();
+  if (norm === "v1.4.7" || norm === "1.4.7") {
+    return { list: entries.filter((e) => e.version === "1.4.7"), label: "Versao v1.4.7 (Atual)" };
+  }
   if (norm === "v1.4.6" || norm === "1.4.6") {
-    return { list: entries.filter((e) => e.version === "1.4.6"), label: "Versao v1.4.6 (Atual)" };
+    return { list: entries.filter((e) => e.version === "1.4.6"), label: "Versao v1.4.6 (08/nov–10/nov)" };
   }
   if (norm === "v1.4.5" || norm === "1.4.5") {
     return { list: entries.filter((e) => e.version === "1.4.5"), label: "Versao v1.4.5 (06/nov–08/nov)" };
@@ -341,7 +349,7 @@ function filterKpiEntriesByWindow(entries: KpiCallEntry[], windowKey: string, no
   if (norm === "all") {
     return { list: entries, label: "Todo o historico" };
   }
-  return { list: entries.filter((e) => e.version === "1.4.6"), label: "Versao v1.4.6 (Atual)" };
+  return { list: entries.filter((e) => e.version === "1.4.7"), label: "Versao v1.4.7 (Atual)" };
 }
 
 function computeKpiWindowMetrics(entries: KpiCallEntry[], windowKey: string, windowLabel: string): KpiWindowMetrics {
@@ -494,7 +502,8 @@ function computeKpiWindowMetrics(entries: KpiCallEntry[], windowKey: string, win
     if ((e.tool === "edit_file" || e.tool === "multi_edit_file") && e.isError && e.targetPath) {
       recoverableErrors += 1;
       let usedReadOnTarget = false;
-      const maxLookahead = Math.min(totalCalls - 1, i + 12);
+      const errParentDir = e.targetPath.includes("/") ? e.targetPath.slice(0, e.targetPath.lastIndexOf("/")) : "";
+      const maxLookahead = Math.min(totalCalls - 1, i + 20);
       for (let j = i + 1; j <= maxLookahead; j += 1) {
         const next = entries[j];
         if (next.tsMs - e.tsMs > 10 * 60_000) break;
@@ -502,8 +511,14 @@ function computeKpiWindowMetrics(entries: KpiCallEntry[], windowKey: string, win
           usedReadOnTarget = true;
         } else if (next.tool === "read_files" && next.targetPaths?.includes(e.targetPath)) {
           usedReadOnTarget = true;
-        } else if ((next.tool === "edit_file" || next.tool === "multi_edit_file") && next.targetPath === e.targetPath) {
-          if (!next.isError) {
+        } else if (next.tool === "edit_file" || next.tool === "multi_edit_file") {
+          const sameTarget = next.targetPath === e.targetPath;
+          const nextParentDir =
+            next.targetPath && next.targetPath.includes("/")
+              ? next.targetPath.slice(0, next.targetPath.lastIndexOf("/"))
+              : "";
+          const typoSiblingRecovery = e.errorKind === "enoent" && Boolean(errParentDir) && nextParentDir === errParentDir;
+          if ((sameTarget || typoSiblingRecovery) && !next.isError) {
             if (!usedReadOnTarget) selfHealedWithoutRead += 1;
             else recoveredWithRead += 1;
             break;
@@ -1108,9 +1123,10 @@ export class McpMonitor {
     };
   }
 
-  getKpiReport(windowKey = "v1.4.6", compareKey = "v1.4.5"): KpiComparisonReport {
+  getKpiReport(windowKey = "v1.4.7", compareKey = "v1.4.6"): KpiComparisonReport {
     const nowMs = Date.now();
     const versionCounts: Record<string, number> = {
+      "1.4.7": 0,
       "1.4.6": 0,
       "1.4.5": 0,
       "1.4.4": 0,
@@ -1157,7 +1173,7 @@ export class McpMonitor {
       sessions,
       // Mais recentes primeiro na listagem inicial.
       transactions: [...this.transactions].reverse(),
-      kpis: this.getKpiReport("v1.4.6", "v1.4.5"),
+      kpis: this.getKpiReport("v1.4.7", "v1.4.6"),
     };
   }
 
@@ -1183,8 +1199,8 @@ export class McpMonitor {
 
     router.get("/logs/kpis", (req: Request, res: Response) => {
       res.setHeader("Cache-Control", "no-store");
-      const windowKey = typeof req.query.window === "string" ? req.query.window : "v1.4.6";
-      const compareKey = typeof req.query.compare === "string" ? req.query.compare : "v1.4.5";
+      const windowKey = typeof req.query.window === "string" ? req.query.window : "v1.4.7";
+      const compareKey = typeof req.query.compare === "string" ? req.query.compare : "v1.4.6";
       res.json(this.getKpiReport(windowKey, compareKey));
     });
 
@@ -2124,7 +2140,8 @@ function renderLogsDashboardHtml(): string {
       <div class="filter-controls">
         <label class="muted" style="font-size:12px;font-weight:600;text-transform:uppercase;">Janela / Versao:</label>
         <select id="kpi-window-select">
-          <option value="v1.4.6" selected>Versao Atual (v1.4.6)</option>
+          <option value="v1.4.7" selected>Versao Atual (v1.4.7)</option>
+          <option value="v1.4.6">Versao v1.4.6 (08/nov–10/nov)</option>
           <option value="v1.4.5">Versao v1.4.5 (06/nov–08/nov)</option>
           <option value="v1.4.4">Versao v1.4.4 (25/out–06/nov)</option>
           <option value="v1.4.3">Versao v1.4.3 (20/out–25/out)</option>
@@ -2136,7 +2153,8 @@ function renderLogsDashboardHtml(): string {
 
         <label class="muted" style="font-size:12px;font-weight:600;text-transform:uppercase;margin-left:8px;">Comparar com:</label>
         <select id="kpi-compare-select">
-          <option value="v1.4.5" selected>Baseline v1.4.5</option>
+          <option value="v1.4.6" selected>Baseline v1.4.6</option>
+          <option value="v1.4.5">Baseline v1.4.5</option>
           <option value="v1.4.4">Baseline v1.4.4</option>
           <option value="v1.4.3">Baseline v1.4.3</option>
           <option value="all">Media Historica (Tudo)</option>
@@ -3089,7 +3107,7 @@ function renderLogsDashboardHtml(): string {
     const b = report.baseline;
     const vc = report.versionCounts || {};
     el('kpi-version-counts').textContent =
-      'v1.4.6: ' + (vc['1.4.6'] || 0) + ' | v1.4.5: ' + (vc['1.4.5'] || 0) + ' | v1.4.4: ' + (vc['1.4.4'] || 0) + ' | v1.4.3: ' + (vc['1.4.3'] || 0) + ' | pre-1.4.3: ' + (vc['pre-1.4.3'] || 0);
+      'v1.4.7: ' + (vc['1.4.7'] || 0) + ' | v1.4.6: ' + (vc['1.4.6'] || 0) + ' | v1.4.5: ' + (vc['1.4.5'] || 0) + ' | v1.4.4: ' + (vc['1.4.4'] || 0) + ' | v1.4.3: ' + (vc['1.4.3'] || 0) + ' | pre-1.4.3: ' + (vc['pre-1.4.3'] || 0);
 
     const sr = c.sampleReadiness;
     const rBadge = el('kpi-readiness-badge');
@@ -3316,8 +3334,8 @@ function renderLogsDashboardHtml(): string {
   }
 
   function fetchKpis() {
-    const win = el('kpi-window-select').value || 'v1.4.6';
-    const cmp = el('kpi-compare-select').value || 'v1.4.5';
+    const win = el('kpi-window-select').value || 'v1.4.7';
+    const cmp = el('kpi-compare-select').value || 'v1.4.6';
     state.lastKpiFetchMs = Date.now();
     fetch('/logs/kpis?window=' + encodeURIComponent(win) + '&compare=' + encodeURIComponent(cmp))
       .then((r) => r.ok ? r.json() : null)

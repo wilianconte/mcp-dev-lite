@@ -4,8 +4,8 @@ import os from "node:os";
 import path from "node:path";
 
 export const DEFAULT_OUTPUT_PAGE_CHARS = 30_000;
-const MAX_ARTIFACTS = 50;
-const ARTIFACT_TTL_MS = 60 * 60 * 1000;
+const MAX_ARTIFACTS = 250;
+const ARTIFACT_TTL_MS = 24 * 60 * 60 * 1000;
 const STORE_DIR = path.join(os.tmpdir(), "mcp-dev-agent-output");
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
@@ -154,11 +154,11 @@ export async function readTextArtifact(
   const target = path.join(STORE_DIR, `${id}.txt`);
   const stat = await fs.lstat(target).catch(() => null);
   if (!stat?.isFile()) {
-    throw new Error(`artifact_id desconhecido ou expirado: ${id}. Saidas de comando ficam disponiveis por ate 1 hora.`);
+    throw new Error(`artifact_id desconhecido ou expirado: ${id}. Saidas de comando ficam disponiveis por ate 24 horas.`);
   }
   if (now - stat.mtimeMs > ARTIFACT_TTL_MS) {
     await fs.rm(target, { force: true }).catch(() => undefined);
-    throw new Error(`artifact_id expirado: ${id}. Saidas de comando ficam disponiveis por ate 1 hora.`);
+    throw new Error(`artifact_id expirado: ${id}. Saidas de comando ficam disponiveis por ate 24 horas.`);
   }
 
   const content = await fs.readFile(target, "utf8");

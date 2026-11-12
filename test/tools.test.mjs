@@ -862,3 +862,109 @@ test('v1.4.7: normalizacao de indentacao a esquerda, validacao multi-bloco em mu
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test('v1.4.8: fallback de job unico em poll_command, normalizacao de contra-barras duplicadas em Bash/Markdown, resumo de edicoes validadas em multi_edit_file e sugestoes por tokens', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'mcp-dev-test-v148-'));
+  try {
+    // 1. Normalizacao automatica de contra-barras sobre-escapadas (\\\\\\n -> \\\n) em scripts Bash
+    const shFile = path.join(root, 'validate-stack.sh');
+    await writeFile(
+      shFile,
+      [
+        '#!/usr/bin/env bash',
+        'for f in \\',
+        '  "$B/api-management-control-plane/15-release-proof.yml" \\',
+        '  "$B/api-management/00-reconciler-rbac.yml"; do',
+        '  echo "$f"',
+        'done',
+      ].join('\n'),
+      'utf8',
+    );
+
+    await tool('multi_edit_file').handler({
+      path: shFile,
+      edits: [
+        {
+          old_string: '  "$B/api-management-control-plane/15-release-proof.yml" \\\\\n  "$B/api-management/00-reconciler-rbac.yml"; do',
+          new_string:
+            '  "$B/api-management-control-plane/15-release-proof.yml" \\\\\n  "$B/admin-api-management/00-admin.yml" \\\\\n  "$B/api-management/00-reconciler-rbac.yml"; do',
+        },
+      ],
+    });
+    const shUpdated = await readFile(shFile, 'utf8');
+    assert.match(
+      shUpdated,
+      /"\$B\/api-management-control-plane\/15-release-proof\.yml" \\\n  "\$B\/admin-api-management\/00-admin\.yml" \\\n  "\$B\/api-management\/00-reconciler-rbac\.yml"; do/,
+    );
+
+    // 2. Resumo do lote em multi_edit_file quando a Edicao #1 falha mas Edicoes #2 e #3 sao validadas OK
+    const docFile = path.join(root, 'STATUS.md');
+    await writeFile(
+      docFile,
+      [
+        '## CURRENT',
+        '- Linha 1 original',
+        '- Linha 2 valida',
+        '- Linha 3 valida',
+      ].join('\n'),
+      'utf8',
+    );
+
+    await assert.rejects(
+      () =>
+        tool('multi_edit_file').handler({
+          path: docFile,
+          edits: [
+            { old_string: '- Linha 1 divergente inexistente', new_string: '- Linha 1 nova' },
+            { old_string: '- Linha 2 valida', new_string: '- Linha 2 atualizada' },
+            { old_string: '- Linha 3 valida', new_string: '- Linha 3 atualizada' },
+          ],
+        }),
+      /\[Resumo do lote: edicoes #2, #3 validadas OK/,
+    );
+
+    // 3. Sugestao encontrada por sobreposicao de tokens (ex.: wp017-api-restart-probe.log -> wp017-api-restart-20261111.tsv)
+    const tsvFile = path.join(root, 'wp017-api-restart-20261111.tsv');
+    await writeFile(tsvFile, 'ts\tstatus\n', 'utf8');
+    await assert.rejects(
+      () => tool('read_file').handler({ path: path.join(root, 'wp017-api-restart-probe.log') }),
+      /Sugestao encontrada: .*wp017-api-restart-20261111\.tsv/,
+    );
+
+    // 4. poll_command: fallback automatico para o unico job running quando job_id e alucinado ou omitido (somente-leitura)
+    const startRes = await tool('start_command').handler({
+      command: 'printf "job_unico_ativo\\n" && sleep 15',
+      cwd: root,
+      wait_ms: 150,
+    });
+    const realJobId = textOf(startRes).match(/job_id: ([0-9a-f-]{36})/)?.[1];
+    assert.ok(realJobId);
+
+    const hallucinatedId = '4d8d90c2-8d84-43e6-91d6-40ef63e4b7a0';
+    const pollHallucinated = await tool('poll_command').handler({
+      job_id: hallucinatedId,
+      wait_ms: 50,
+      offset: 0,
+    });
+    const pollHallucinatedText = textOf(pollHallucinated);
+    assert.match(pollHallucinatedText, new RegExp(`job_id: ${realJobId}`));
+    assert.match(pollHallucinatedText, new RegExp(`job_id_autocorrected_from: ${hallucinatedId}`));
+    assert.match(pollHallucinatedText, /job_unico_ativo/);
+
+    const pollOmitted = await tool('poll_command').handler({
+      wait_ms: 50,
+      offset: 0,
+    });
+    assert.match(textOf(pollOmitted), new RegExp(`job_id: ${realJobId}`));
+
+    // kill=true NUNCA deve fazer fallback para job com UUID completamente diferente
+    await assert.rejects(
+      () => tool('poll_command').handler({ job_id: hallucinatedId, kill: true }),
+      /Job nao encontrado ou expirado/,
+    );
+
+    await tool('poll_command').handler({ job_id: realJobId, kill: true });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

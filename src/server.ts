@@ -61,7 +61,7 @@ const toolDescriptors = tools.map((tool) => ({
 /** Cria uma instancia do servidor MCP com todas as ferramentas registradas. */
 function buildServer(context: AuditRequestContext = {}): McpServer {
   const server = new McpServer(
-    { name: "mcp-dev-agent", version: "1.4.7" },
+    { name: "mcp-dev-agent", version: "1.4.8" },
     {
       instructions:
         "Servidor de desenvolvimento na VM (17 ferramentas). Siga estas diretrizes de escolha de ferramentas para maxima performance:\n" +

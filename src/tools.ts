@@ -786,13 +786,17 @@ function uuidHammingDistance(a: string, b: string): number {
 }
 
 async function resolveJobWithTypoTolerance(
-  requestedId: string,
+  requestedId: string | undefined,
+  allowSingleRunningFallback = false,
 ): Promise<{ job?: BackgroundJob; autoCorrectedFrom?: string; activeJobsHint: string }> {
-  const exact = backgroundJobs.get(requestedId) ?? (await loadPersistedJob(requestedId));
-  if (exact) {
-    return { job: exact, activeJobsHint: "" };
+  const cleanId = requestedId?.trim() ?? "";
+  if (cleanId) {
+    const exact = backgroundJobs.get(cleanId) ?? (await loadPersistedJob(cleanId));
+    if (exact) {
+      return { job: exact, activeJobsHint: "" };
+    }
   }
-  const normReq = requestedId.toLowerCase();
+  const normReq = cleanId.toLowerCase();
   try {
     const entries = await fs.readdir(JOBS_STORE_DIR);
     for (const entry of entries) {
@@ -806,22 +810,39 @@ async function resolveJobWithTypoTolerance(
     // Ignora se diretorio ainda nao existir.
   }
 
-  let bestJob: BackgroundJob | undefined;
-  let bestDist = 999;
-  let ties = 0;
-  for (const candidate of backgroundJobs.values()) {
-    const dist = uuidHammingDistance(normReq, candidate.id.toLowerCase());
-    if (dist < bestDist) {
-      bestDist = dist;
-      bestJob = candidate;
-      ties = 1;
-    } else if (dist === bestDist) {
-      ties += 1;
+  if (normReq) {
+    let bestJob: BackgroundJob | undefined;
+    let bestDist = 999;
+    let ties = 0;
+    for (const candidate of backgroundJobs.values()) {
+      const dist = uuidHammingDistance(normReq, candidate.id.toLowerCase());
+      if (dist < bestDist) {
+        bestDist = dist;
+        bestJob = candidate;
+        ties = 1;
+      } else if (dist === bestDist) {
+        ties += 1;
+      }
+    }
+
+    if (bestJob && bestDist <= 2 && ties === 1) {
+      return { job: bestJob, autoCorrectedFrom: cleanId, activeJobsHint: "" };
     }
   }
 
-  if (bestJob && bestDist <= 2 && ties === 1) {
-    return { job: bestJob, autoCorrectedFrom: requestedId, activeJobsHint: "" };
+  // Fallback v1.4.8: em operacoes somente-leitura (kill=false), se o job_id foi omitido ou alucinado pelo agente
+  // e existe exatamente 1 job em execucao ativa (running), resolve automaticamente para esse job.
+  if (allowSingleRunningFallback) {
+    const runningJobs = Array.from(backgroundJobs.values()).filter(
+      (j) => j.status === "running" && isProcessAlive(j.pid),
+    );
+    if (runningJobs.length === 1) {
+      return {
+        job: runningJobs[0],
+        autoCorrectedFrom: cleanId || undefined,
+        activeJobsHint: "",
+      };
+    }
   }
 
   const recentJobs = Array.from(backgroundJobs.values())
@@ -1032,11 +1053,23 @@ function previewText(text: string): { text: string; truncated: boolean } {
   };
 }
 
-/** Resolve ~ e caminhos relativos para um caminho absoluto. */
+/** Resolve ~ e caminhos relativos para um caminho absoluto, auto-resolvendo worktrees em /root/repos/work quando /work/ e omitido. */
 function resolvePath(p: string): string {
-  if (p === "~") return os.homedir();
-  if (p.startsWith("~/")) return path.join(os.homedir(), p.slice(2));
-  return path.resolve(p);
+  const expanded = p === "~" ? os.homedir() : p.startsWith("~/") ? path.join(os.homedir(), p.slice(2)) : p;
+  const resolved = path.resolve(expanded);
+  if (resolved.startsWith("/root/repos/")) {
+    const rel = resolved.slice("/root/repos/".length);
+    const firstSeg = rel.split("/")[0];
+    if (
+      firstSeg &&
+      firstSeg !== "work" &&
+      !existsSync(path.join("/root/repos", firstSeg)) &&
+      existsSync(path.join("/root/repos/work", firstSeg))
+    ) {
+      return path.join("/root/repos/work", rel);
+    }
+  }
+  return resolved;
 }
 
 async function commandResult(fullOutput: string): Promise<CallToolResult> {
@@ -1249,6 +1282,39 @@ function findNormalizedUniqueMatch(
           }
         }
         return { index: matchIndex, length: matchedBlock.length, adjustedNewStr };
+      }
+    }
+  }
+  // Passo 4 (v1.4.8): normalizacao de contra-barras sobre-escapadas em scripts Bash/Markdown (ex.: "\\\\\n" -> "\\\n", "\\\\\"" -> "\\\"").
+  if (oldStr.includes("\\\\")) {
+    let candidateOld = oldStr;
+    let candidateNew = newStr;
+    for (let pass = 0; pass < 2; pass += 1) {
+      if (!candidateOld.includes("\\\\")) break;
+      candidateOld = candidateOld.replace(/\\\\/g, "\\");
+      if (candidateNew !== undefined) {
+        candidateNew = candidateNew.replace(/\\\\/g, "\\");
+      }
+      const unescapedOcc = countOccurrences(content, candidateOld);
+      if (unescapedOcc.count === 1) {
+        return {
+          index: unescapedOcc.firstIndex,
+          length: candidateOld.length,
+          adjustedNewStr: candidateNew,
+        };
+      }
+      if (candidateOld.includes('\\"')) {
+        const quoteUnescapedOld = candidateOld.replace(/\\\\"/g, '\\"');
+        if (quoteUnescapedOld !== candidateOld) {
+          const quoteOcc = countOccurrences(content, quoteUnescapedOld);
+          if (quoteOcc.count === 1) {
+            return {
+              index: quoteOcc.firstIndex,
+              length: quoteUnescapedOld.length,
+              adjustedNewStr: candidateNew !== undefined ? candidateNew.replace(/\\\\"/g, '\\"') : undefined,
+            };
+          }
+        }
       }
     }
   }
@@ -1617,6 +1683,19 @@ async function inspectMissingPathDetails(target: string): Promise<MissingPathDet
           return entryCollator.compare(a.dirent.name, b.dirent.name);
         });
 
+        for (const item of scored) {
+          if (candidates.length >= 3) break;
+          if (item.score < 30) break;
+          if (!missingRemainder) {
+            candidates.push(path.join(parent, item.dirent.name));
+          } else if (item.dirent.isDirectory()) {
+            const subCand = path.join(parent, item.dirent.name, missingRemainder);
+            if (existsSync(subCand)) {
+              candidates.push(subCand);
+            }
+          }
+        }
+
         const availableEntries = scored
           .slice(0, 25)
           .map(({ dirent }) => (dirent.isDirectory() ? `${dirent.name}/` : dirent.name));
@@ -1950,7 +2029,10 @@ export const tools: ToolDef[] = [
       "aguardando ate wait_ms pela conclusao (padrao 60000ms, max 180000ms), ou encerra todo o grupo de processos se kill=true. " +
       "BOAS PRATICAS: passe sempre offset com o valor de next_offset retornado na chamada anterior (o stderr tambem sera fatiado incrementalmente de forma automatica) e use wait_ms entre 60000 e 180000 para jobs longos (retorna imediatamente assim que o job concluir).",
     schema: {
-      job_id: z.string().uuid().describe("ID do job retornado por start_command."),
+      job_id: z
+        .string()
+        .optional()
+        .describe("ID do job retornado por start_command (opcional quando ha apenas 1 job em execucao)."),
       wait_ms: z
         .number()
         .int()
@@ -1976,12 +2058,12 @@ export const tools: ToolDef[] = [
         .describe("Se true, encerra o grupo de processos do job (SIGTERM -> SIGKILL). Padrao: false."),
     },
     handler: async (args) => {
-      const jobId = args.job_id as string;
-      const { job, autoCorrectedFrom, activeJobsHint } = await resolveJobWithTypoTolerance(jobId);
-      if (!job) {
-        throw new Error(`Job nao encontrado ou expirado: ${jobId}.${activeJobsHint}`);
-      }
+      const jobId = args.job_id as string | undefined;
       const kill = (args.kill as boolean | undefined) ?? false;
+      const { job, autoCorrectedFrom, activeJobsHint } = await resolveJobWithTypoTolerance(jobId, !kill);
+      if (!job) {
+        throw new Error(`Job nao encontrado ou expirado: ${jobId ?? "(nenhum job_id informado)"}.${activeJobsHint}`);
+      }
       const offset = (args.offset as number | undefined) ?? 0;
       const stderrOffset = args.stderr_offset as number | undefined;
       if (kill) {
@@ -2618,10 +2700,12 @@ export const tools: ToolDef[] = [
       let updated = await fs.readFile(target, "utf8");
       let totalReplacements = 0;
       const failures: string[] = [];
+      const passedEditNumbers: number[] = [];
 
       for (let i = 0; i < edits.length; i += 1) {
         const edit = edits[i];
         if (edit.old_string === edit.new_string) {
+          passedEditNumbers.push(i + 1);
           continue;
         }
         const replaceAll = edit.replace_all ?? false;
@@ -2637,6 +2721,7 @@ export const tools: ToolDef[] = [
               .slice(0, i)
               .some((prev) => prev.old_string === edit.old_string && prev.new_string === edit.new_string);
           if (alreadyAppliedInBatch) {
+            passedEditNumbers.push(i + 1);
             continue;
           }
           if (!replaceAll) {
@@ -2645,9 +2730,11 @@ export const tools: ToolDef[] = [
               const replacementStr = normalized.adjustedNewStr ?? edit.new_string;
               updated = `${updated.slice(0, normalized.index)}${replacementStr}${updated.slice(normalized.index + normalized.length)}`;
               totalReplacements += 1;
+              passedEditNumbers.push(i + 1);
               continue;
             }
             if (edit.new_string.trim().length >= 15 && countOccurrences(updated, edit.new_string).count === 1) {
+              passedEditNumbers.push(i + 1);
               continue;
             }
           }
@@ -2686,16 +2773,23 @@ export const tools: ToolDef[] = [
           edit.new_string.includes(edit.old_string) &&
           countOccurrences(updated, edit.new_string).count === 1
         ) {
+          passedEditNumbers.push(i + 1);
           continue;
         }
         updated = replaceAll
           ? updated.replaceAll(edit.old_string, edit.new_string)
           : `${updated.slice(0, firstIndex)}${edit.new_string}${updated.slice(firstIndex + edit.old_string.length)}`;
         totalReplacements += replaceAll ? occurrences : 1;
+        passedEditNumbers.push(i + 1);
       }
 
       if (failures.length > 0) {
-        throw new Error(failures.join("\n\n"));
+        const passedLabels = passedEditNumbers.map((n) => `#${n}`).join(", ");
+        const batchSummary =
+          passedEditNumbers.length > 0
+            ? `\n\n[Resumo do lote: edicoes ${passedLabels} validadas OK — corrija apenas a(s) edicao(oes) com falha acima]`
+            : "";
+        throw new Error(`${failures.join("\n\n")}${batchSummary}`);
       }
 
       await fs.writeFile(target, updated, "utf8");

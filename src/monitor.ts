@@ -317,8 +317,11 @@ const NATIVE_READ_SEARCH_TOOLS = new Set([
 
 function filterKpiEntriesByWindow(entries: KpiCallEntry[], windowKey: string, nowMs = Date.now()): { list: KpiCallEntry[]; label: string } {
   const norm = (windowKey || `v${MCP_SERVER_VERSION}`).trim();
+  if (norm === "v1.4.8" || norm === "1.4.8") {
+    return { list: entries.filter((e) => e.version === "1.4.8"), label: "Versao v1.4.8 (Atual)" };
+  }
   if (norm === "v1.4.7" || norm === "1.4.7") {
-    return { list: entries.filter((e) => e.version === "1.4.7"), label: "Versao v1.4.7 (Atual)" };
+    return { list: entries.filter((e) => e.version === "1.4.7"), label: "Versao v1.4.7 (11/nov–12/nov)" };
   }
   if (norm === "v1.4.6" || norm === "1.4.6") {
     return { list: entries.filter((e) => e.version === "1.4.6"), label: "Versao v1.4.6 (08/nov–10/nov)" };
@@ -349,7 +352,7 @@ function filterKpiEntriesByWindow(entries: KpiCallEntry[], windowKey: string, no
   if (norm === "all") {
     return { list: entries, label: "Todo o historico" };
   }
-  return { list: entries.filter((e) => e.version === "1.4.7"), label: "Versao v1.4.7 (Atual)" };
+  return { list: entries.filter((e) => e.version === "1.4.8"), label: "Versao v1.4.8 (Atual)" };
 }
 
 function computeKpiWindowMetrics(entries: KpiCallEntry[], windowKey: string, windowLabel: string): KpiWindowMetrics {
@@ -1123,9 +1126,10 @@ export class McpMonitor {
     };
   }
 
-  getKpiReport(windowKey = "v1.4.7", compareKey = "v1.4.6"): KpiComparisonReport {
+  getKpiReport(windowKey = "v1.4.8", compareKey = "v1.4.7"): KpiComparisonReport {
     const nowMs = Date.now();
     const versionCounts: Record<string, number> = {
+      "1.4.8": 0,
       "1.4.7": 0,
       "1.4.6": 0,
       "1.4.5": 0,
@@ -1173,7 +1177,7 @@ export class McpMonitor {
       sessions,
       // Mais recentes primeiro na listagem inicial.
       transactions: [...this.transactions].reverse(),
-      kpis: this.getKpiReport("v1.4.7", "v1.4.6"),
+      kpis: this.getKpiReport("v1.4.8", "v1.4.7"),
     };
   }
 
@@ -1199,8 +1203,8 @@ export class McpMonitor {
 
     router.get("/logs/kpis", (req: Request, res: Response) => {
       res.setHeader("Cache-Control", "no-store");
-      const windowKey = typeof req.query.window === "string" ? req.query.window : "v1.4.7";
-      const compareKey = typeof req.query.compare === "string" ? req.query.compare : "v1.4.6";
+      const windowKey = typeof req.query.window === "string" ? req.query.window : "v1.4.8";
+      const compareKey = typeof req.query.compare === "string" ? req.query.compare : "v1.4.7";
       res.json(this.getKpiReport(windowKey, compareKey));
     });
 
@@ -2140,7 +2144,8 @@ function renderLogsDashboardHtml(): string {
       <div class="filter-controls">
         <label class="muted" style="font-size:12px;font-weight:600;text-transform:uppercase;">Janela / Versao:</label>
         <select id="kpi-window-select">
-          <option value="v1.4.7" selected>Versao Atual (v1.4.7)</option>
+          <option value="v1.4.8" selected>Versao Atual (v1.4.8)</option>
+          <option value="v1.4.7">Versao v1.4.7 (11/nov–12/nov)</option>
           <option value="v1.4.6">Versao v1.4.6 (08/nov–10/nov)</option>
           <option value="v1.4.5">Versao v1.4.5 (06/nov–08/nov)</option>
           <option value="v1.4.4">Versao v1.4.4 (25/out–06/nov)</option>
@@ -2153,7 +2158,8 @@ function renderLogsDashboardHtml(): string {
 
         <label class="muted" style="font-size:12px;font-weight:600;text-transform:uppercase;margin-left:8px;">Comparar com:</label>
         <select id="kpi-compare-select">
-          <option value="v1.4.6" selected>Baseline v1.4.6</option>
+          <option value="v1.4.7" selected>Baseline v1.4.7</option>
+          <option value="v1.4.6">Baseline v1.4.6</option>
           <option value="v1.4.5">Baseline v1.4.5</option>
           <option value="v1.4.4">Baseline v1.4.4</option>
           <option value="v1.4.3">Baseline v1.4.3</option>
@@ -3107,7 +3113,7 @@ function renderLogsDashboardHtml(): string {
     const b = report.baseline;
     const vc = report.versionCounts || {};
     el('kpi-version-counts').textContent =
-      'v1.4.7: ' + (vc['1.4.7'] || 0) + ' | v1.4.6: ' + (vc['1.4.6'] || 0) + ' | v1.4.5: ' + (vc['1.4.5'] || 0) + ' | v1.4.4: ' + (vc['1.4.4'] || 0) + ' | v1.4.3: ' + (vc['1.4.3'] || 0) + ' | pre-1.4.3: ' + (vc['pre-1.4.3'] || 0);
+      'v1.4.8: ' + (vc['1.4.8'] || 0) + ' | v1.4.7: ' + (vc['1.4.7'] || 0) + ' | v1.4.6: ' + (vc['1.4.6'] || 0) + ' | v1.4.5: ' + (vc['1.4.5'] || 0) + ' | v1.4.4: ' + (vc['1.4.4'] || 0) + ' | v1.4.3: ' + (vc['1.4.3'] || 0) + ' | pre-1.4.3: ' + (vc['pre-1.4.3'] || 0);
 
     const sr = c.sampleReadiness;
     const rBadge = el('kpi-readiness-badge');
@@ -3334,8 +3340,8 @@ function renderLogsDashboardHtml(): string {
   }
 
   function fetchKpis() {
-    const win = el('kpi-window-select').value || 'v1.4.7';
-    const cmp = el('kpi-compare-select').value || 'v1.4.6';
+    const win = el('kpi-window-select').value || 'v1.4.8';
+    const cmp = el('kpi-compare-select').value || 'v1.4.7';
     state.lastKpiFetchMs = Date.now();
     fetch('/logs/kpis?window=' + encodeURIComponent(win) + '&compare=' + encodeURIComponent(cmp))
       .then((r) => r.ok ? r.json() : null)

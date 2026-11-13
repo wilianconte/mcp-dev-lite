@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, readFileSync, readdirSync, promises as fs } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync, promises as fs } from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import { z } from "zod";
@@ -95,6 +95,107 @@ function isProcessAlive(pid: number | undefined): boolean {
 const commandEnvCache = new Map<string, { expiresAt: number; pathValue: string }>();
 const COMMAND_ENV_CACHE_TTL_MS = 60_000;
 const numericVersionCollator = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
+const entryCollator = new Intl.Collator();
+
+interface CachedDirectoryIndex {
+  mtimeMs: number;
+  dirNames: string[];
+  lowerDirMap: Map<string, string>;
+}
+
+const directoryIndexCache = new Map<string, CachedDirectoryIndex>();
+const MAX_DIR_INDEX_CACHE_ENTRIES = 12;
+let dirIndexCacheHits = 0;
+let dirIndexCacheMisses = 0;
+
+function getCachedDirectoryIndex(dirPath: string): CachedDirectoryIndex | null {
+  try {
+    const st = statSync(dirPath);
+    if (!st.isDirectory()) return null;
+    const cached = directoryIndexCache.get(dirPath);
+    if (cached && cached.mtimeMs === st.mtimeMs) {
+      dirIndexCacheHits += 1;
+      directoryIndexCache.delete(dirPath);
+      directoryIndexCache.set(dirPath, cached);
+      return cached;
+    }
+    dirIndexCacheMisses += 1;
+    const dirents = readdirSync(dirPath, { withFileTypes: true });
+    const dirNames: string[] = [];
+    const lowerDirMap = new Map<string, string>();
+    for (const d of dirents) {
+      if (d.isDirectory()) {
+        dirNames.push(d.name);
+        lowerDirMap.set(d.name.toLowerCase(), d.name);
+      }
+    }
+    dirNames.sort((a, b) => entryCollator.compare(a, b));
+    const entry: CachedDirectoryIndex = {
+      mtimeMs: st.mtimeMs,
+      dirNames,
+      lowerDirMap,
+    };
+    if (directoryIndexCache.size >= MAX_DIR_INDEX_CACHE_ENTRIES) {
+      const oldestKey = directoryIndexCache.keys().next().value;
+      if (oldestKey !== undefined) directoryIndexCache.delete(oldestKey);
+    }
+    directoryIndexCache.set(dirPath, entry);
+    return entry;
+  } catch {
+    return null;
+  }
+}
+
+interface CachedFilePaginationEntry {
+  mtimeMs: number;
+  size: number;
+  content: string;
+  lines: string[] | null;
+  totalLines: number;
+}
+
+const filePaginationCache = new Map<string, CachedFilePaginationEntry>();
+const MAX_FILE_CACHE_ENTRIES = 16;
+const MAX_FILE_CACHE_BYTES = 512 * 1024;
+let fileCacheHits = 0;
+let fileCacheMisses = 0;
+let fileCacheBytesSaved = 0;
+let reattachedBackgroundJobs = 0;
+let autoReapedWatchers = 0;
+
+function invalidateFileCache(targetPath?: string): void {
+  if (!targetPath) {
+    filePaginationCache.clear();
+    return;
+  }
+  filePaginationCache.delete(targetPath);
+}
+
+export interface InternalCacheAndControlStats {
+  dirIndexHits: number;
+  dirIndexMisses: number;
+  dirIndexEntries: number;
+  fileLruHits: number;
+  fileLruMisses: number;
+  fileLruBytesSaved: number;
+  fileLruEntries: number;
+  reattachedBackgroundJobs: number;
+  autoReapedWatchers: number;
+}
+
+export function getInternalCacheStats(): InternalCacheAndControlStats {
+  return {
+    dirIndexHits: dirIndexCacheHits,
+    dirIndexMisses: dirIndexCacheMisses,
+    dirIndexEntries: directoryIndexCache.size,
+    fileLruHits: fileCacheHits,
+    fileLruMisses: fileCacheMisses,
+    fileLruBytesSaved: fileCacheBytesSaved,
+    fileLruEntries: filePaginationCache.size,
+    reattachedBackgroundJobs,
+    autoReapedWatchers,
+  };
+}
 
 function extractNodeVersionFromPackageJson(pkgPath: string, currentMajor: number): string {
   try {
@@ -311,6 +412,7 @@ interface BackgroundJob {
   cwd: string;
   pid?: number;
   startedAtMs: number;
+  lastPolledAtMs: number;
   finishedAtMs?: number;
   status: "running" | "completed" | "timed_out" | "output_limit" | "killed";
   exitCode: number | string | null;
@@ -397,6 +499,7 @@ async function loadPersistedJob(id: string): Promise<BackgroundJob | undefined> 
       cwd: snap.cwd,
       pid: snap.pid,
       startedAtMs: snap.startedAtMs,
+      lastPolledAtMs: snap.finishedAtMs ?? snap.startedAtMs,
       finishedAtMs: snap.finishedAtMs,
       status: snap.status,
       exitCode: snap.exitCode,
@@ -508,12 +611,14 @@ function startBackgroundJob(command: string, cwd: string, timeoutMs: number): Ba
     stdio: ["ignore", "pipe", "pipe"],
   });
 
+  const nowMs = Date.now();
   const job: BackgroundJob = {
     id,
     command,
     cwd,
     pid: child.pid,
-    startedAtMs: Date.now(),
+    startedAtMs: nowMs,
+    lastPolledAtMs: nowMs,
     status: "running",
     exitCode: null,
     stdoutChunks: [],
@@ -836,9 +941,16 @@ async function resolveJobWithTypoTolerance(
     const runningJobs = Array.from(backgroundJobs.values()).filter(
       (j) => j.status === "running" && isProcessAlive(j.pid),
     );
-    if (runningJobs.length === 1) {
+    const inMemoryRunning = runningJobs.filter((j) => !j.recoveredFromDisk);
+    const singleCandidate =
+      runningJobs.length === 1
+        ? runningJobs[0]
+        : inMemoryRunning.length === 1
+          ? inMemoryRunning[0]
+          : undefined;
+    if (singleCandidate) {
       return {
-        job: runningJobs[0],
+        job: singleCandidate,
         autoCorrectedFrom: cleanId || undefined,
         activeJobsHint: "",
       };
@@ -869,7 +981,9 @@ async function formatJobResult(
   stdoutOffset = 0,
   explicitStderrOffset?: number,
   autoCorrectedFrom?: string,
+  reattachedToRunningJob = false,
 ): Promise<CallToolResult> {
+  job.lastPolledAtMs = Date.now();
   const fullStdout = Buffer.concat(job.stdoutChunks).toString("utf8");
   const fullStderr = Buffer.concat(job.stderrChunks).toString("utf8");
   const safeOffset = Math.min(Math.max(0, stdoutOffset), fullStdout.length);
@@ -930,6 +1044,9 @@ async function formatJobResult(
   const parts = [
     `job_id: ${job.id}`,
     autoCorrectedFrom ? `job_id_autocorrected_from: ${autoCorrectedFrom}` : "",
+    reattachedToRunningJob
+      ? "reattached_to_running_job: true (reutilizado job identico ja em execucao em vez de criar processo duplicado)"
+      : "",
     `status: ${job.status}`,
     job.exitCode !== null
       ? `exit_code: ${job.exitCode}${job.timedOut ? " (timeout; grupo de processos encerrado)" : ""}`
@@ -1053,20 +1170,48 @@ function previewText(text: string): { text: string; truncated: boolean } {
   };
 }
 
-/** Resolve ~ e caminhos relativos para um caminho absoluto, auto-resolvendo worktrees em /root/repos/work quando /work/ e omitido. */
+/**
+ * Resolve ~ e caminhos relativos para um caminho absoluto, auto-resolvendo worktrees em /root/repos/work
+ * (quando /work/ e omitido ou quando o primeiro '-' do worktree foi trocado por '/', ex.: /root/repos/work/deploy/apim-... -> /root/repos/work/deploy-apim-...).
+ */
 function resolvePath(p: string): string {
   const expanded = p === "~" ? os.homedir() : p.startsWith("~/") ? path.join(os.homedir(), p.slice(2)) : p;
   const resolved = path.resolve(expanded);
+  const workMatch = resolved.match(/^(.*\/work)\/([^/]+)\/([^/]+)(\/.*)?$/);
+  if (workMatch) {
+    const [, workDir, seg1, seg2, rest = ""] = workMatch;
+    if (!existsSync(path.join(workDir, seg1))) {
+      const idx = getCachedDirectoryIndex(workDir);
+      const combined = `${seg1}-${seg2}`;
+      const exactDir =
+        idx?.lowerDirMap.get(combined.toLowerCase()) ??
+        (existsSync(path.join(workDir, combined)) ? combined : undefined);
+      if (exactDir) {
+        return `${path.join(workDir, exactDir)}${rest}`;
+      }
+    }
+  }
   if (resolved.startsWith("/root/repos/")) {
     const rel = resolved.slice("/root/repos/".length);
-    const firstSeg = rel.split("/")[0];
-    if (
-      firstSeg &&
-      firstSeg !== "work" &&
-      !existsSync(path.join("/root/repos", firstSeg)) &&
-      existsSync(path.join("/root/repos/work", firstSeg))
-    ) {
-      return path.join("/root/repos/work", rel);
+    const segs = rel.split("/");
+    const firstSeg = segs[0];
+    if (firstSeg && firstSeg !== "work" && !existsSync(path.join("/root/repos", firstSeg))) {
+      const idx = getCachedDirectoryIndex("/root/repos/work");
+      const exactFirst =
+        idx?.lowerDirMap.get(firstSeg.toLowerCase()) ??
+        (existsSync(path.join("/root/repos/work", firstSeg)) ? firstSeg : undefined);
+      if (exactFirst) {
+        return path.join("/root/repos/work", exactFirst, ...segs.slice(1));
+      }
+      if (segs.length >= 2) {
+        const combined = `${firstSeg}-${segs[1]}`;
+        const exactCombined =
+          idx?.lowerDirMap.get(combined.toLowerCase()) ??
+          (existsSync(path.join("/root/repos/work", combined)) ? combined : undefined);
+        if (exactCombined) {
+          return path.join("/root/repos/work", exactCombined, ...segs.slice(2));
+        }
+      }
     }
   }
   return resolved;
@@ -1127,8 +1272,6 @@ function detectImage(buffer: Buffer): ImageInfo | null {
   }
   return null;
 }
-
-const entryCollator = new Intl.Collator();
 
 function countLines(text: string): number {
   let lines = 1;
@@ -1318,6 +1461,30 @@ function findNormalizedUniqueMatch(
       }
     }
   }
+  // Passo 5 (v1.4.9): tolerancia a permutacoes de escape de aspas em strings Bash (ex.: \'' vs '\'' vs \\'').
+  if (
+    oldStr.length >= 15 &&
+    content.length <= 2_000_000 &&
+    (oldStr.includes("\\'") || oldStr.includes('\\"') || oldStr.includes("\\\\"))
+  ) {
+    const parts = oldStr.split(/(['"\\]{2,})/);
+    if (parts.length >= 3 && parts.length <= 45) {
+      const literalChars = parts
+        .filter((_, idx) => idx % 2 === 0)
+        .join("")
+        .trim().length;
+      if (literalChars >= 12) {
+        const pattern = parts
+          .map((part, idx) => (idx % 2 === 1 ? `['"\\\\]{1,6}` : part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")))
+          .join("");
+        const re = new RegExp(pattern, "g");
+        const first = re.exec(content);
+        if (first && !re.exec(content)) {
+          return { index: first.index, length: first[0].length };
+        }
+      }
+    }
+  }
   return null;
 }
 
@@ -1468,7 +1635,15 @@ function buildMissingOldStringHint(content: string, oldStr: string): string {
     }
   }
 
-  if (matchIdx === -1) return "";
+  if (matchIdx === -1) {
+    if (fileLines.length <= 60 && content.length <= 4_000) {
+      const fullSnippet = fileLines
+        .map((line, i) => `  ${i + 1} | ${formatSnippetLine(line)}`)
+        .join("\n");
+      return `\nConteudo completo do arquivo (${fileLines.length} linhas):\n${fullSnippet}`;
+    }
+    return "";
+  }
 
   const start = Math.max(0, matchIdx - 2);
   const end = Math.min(fileLines.length, matchIdx + Math.min(rawOldLines.length + 4, 12));
@@ -1476,7 +1651,26 @@ function buildMissingOldStringHint(content: string, oldStr: string): string {
     .slice(start, end)
     .map((line, i) => `  ${start + i + 1} | ${formatSnippetLine(line)}`)
     .join("\n");
-  return `\nTrecho similar encontrado proximo a linha ${matchIdx + 1}:\n${snippet}`;
+  let longLineFocus = "";
+  const targetLine = fileLines[matchIdx] ?? "";
+  if (targetLine.length > 400) {
+    const targetLower = targetLine.toLowerCase();
+    let bestCol = -1;
+    for (const tk of tokenSpecs) {
+      if (!tk.isDistinctive && tk.lower.length < 5) continue;
+      const col = targetLower.indexOf(tk.lower, 250);
+      if (col !== -1) {
+        bestCol = col;
+        break;
+      }
+    }
+    if (bestCol !== -1) {
+      const sliceStart = Math.max(0, bestCol - 120);
+      const sliceEnd = Math.min(targetLine.length, bestCol + 280);
+      longLineFocus = `\nFoco na coluna ${sliceStart + 1}..${sliceEnd} da linha ${matchIdx + 1}:\n  ...${targetLine.slice(sliceStart, sliceEnd)}...`;
+    }
+  }
+  return `\nTrecho similar encontrado proximo a linha ${matchIdx + 1}:\n${snippet}${longLineFocus}`;
 }
 
 /** Divide um padrao de busca de arquivos por '|' (quando fora de chaves {}), permitindo alternancia estilo regex/glob. */
@@ -1816,7 +2010,20 @@ async function readSingleFileFormatted(params: FileSliceParams): Promise<string>
   const maxTextBytes = configuredPositiveNumber("MCP_MAX_TEXT_FILE_BYTES", DEFAULT_MAX_TEXT_FILE_BYTES);
 
   let content = "";
-  if (totalBytes > 0) {
+  let cachedLines: string[] | null = null;
+  let cachedTotalLines: number | null = null;
+  const cachedEntry =
+    totalBytes > 0 && totalBytes <= MAX_FILE_CACHE_BYTES ? filePaginationCache.get(target) : undefined;
+
+  if (cachedEntry && cachedEntry.mtimeMs === stat.mtimeMs && cachedEntry.size === totalBytes) {
+    fileCacheHits += 1;
+    fileCacheBytesSaved += totalBytes;
+    filePaginationCache.delete(target);
+    filePaginationCache.set(target, cachedEntry);
+    content = cachedEntry.content;
+    cachedLines = cachedEntry.lines;
+    cachedTotalLines = cachedEntry.totalLines;
+  } else if (totalBytes > 0) {
     const sniffLen = Math.min(totalBytes, BINARY_SNIFF_BYTES);
     const handle = await fs.open(target, "r");
     let sniffBuf: Buffer;
@@ -1840,12 +2047,33 @@ async function readSingleFileFormatted(params: FileSliceParams): Promise<string>
       );
     }
     content = totalBytes <= bytesRead ? sample.toString("utf8") : await fs.readFile(target, "utf8");
+    if (totalBytes <= MAX_FILE_CACHE_BYTES) {
+      fileCacheMisses += 1;
+      const splitLines = hasLineMode ? content.split("\n") : null;
+      const lineCount = splitLines ? splitLines.length : countLines(content);
+      cachedLines = splitLines;
+      cachedTotalLines = lineCount;
+      if (filePaginationCache.size >= MAX_FILE_CACHE_ENTRIES) {
+        const oldestKey = filePaginationCache.keys().next().value;
+        if (oldestKey !== undefined) filePaginationCache.delete(oldestKey);
+      }
+      filePaginationCache.set(target, {
+        mtimeMs: stat.mtimeMs,
+        size: totalBytes,
+        content,
+        lines: splitLines,
+        totalLines: lineCount,
+      });
+    }
   }
 
   const totalChars = content.length;
 
   if (hasLineMode) {
-    const lines = content.split("\n");
+    const lines = cachedLines ?? content.split("\n");
+    if (cachedEntry && !cachedEntry.lines) {
+      cachedEntry.lines = lines;
+    }
     const totalLines = lines.length;
     const startLine = Math.max(1, params.offset ?? 1);
     const requestedLimit = params.limit ?? totalLines;
@@ -1870,7 +2098,7 @@ async function readSingleFileFormatted(params: FileSliceParams): Promise<string>
     return `${header}\n\n${preview.text}`;
   }
 
-  const totalLines = countLines(content);
+  const totalLines = cachedTotalLines ?? countLines(content);
   const charOffset = Math.min(params.char_offset ?? 0, totalChars);
   const charLimit = params.char_limit ?? MAX_PREVIEW_CHARS;
   const end = Math.min(totalChars, charOffset + charLimit);
@@ -2015,6 +2243,34 @@ export const tools: ToolDef[] = [
       const timeoutMs = (args.timeout_ms as number | undefined) ?? 1_200_000;
       const requestedWaitMs = (args.wait_ms as number | undefined) ?? 10_000;
       const waitMs = requestedWaitMs >= 1_000 && requestedWaitMs < 10_000 ? 10_000 : requestedWaitMs;
+
+      // Controle v1.4.9: se um comando longo identico (mesmo cwd + command) ja estiver em execucao ativa,
+      // re-anexa ao job existente em vez de criar um processo duplicado concorrente.
+      const existingRunning = Array.from(backgroundJobs.values()).find(
+        (j) => j.status === "running" && j.cwd === cwd && j.command === command && isProcessAlive(j.pid),
+      );
+      if (existingRunning) {
+        reattachedBackgroundJobs += 1;
+        await waitForJob(existingRunning, waitMs);
+        return formatJobResult(existingRunning, 0, undefined, undefined, true);
+      }
+
+      // Controle v1.4.9: se estiver iniciando um novo 'gh run watch' / 'gh pr checks --watch',
+      // encerra watchers antigos abandonados (>5 min sem poll_command).
+      if (/\bgh\s+(?:run\s+watch|pr\s+checks\b.*--watch)\b/i.test(command)) {
+        const now = Date.now();
+        for (const oldJob of backgroundJobs.values()) {
+          if (
+            oldJob.status === "running" &&
+            /\bgh\s+(?:run\s+watch|pr\s+checks\b.*--watch)\b/i.test(oldJob.command) &&
+            now - oldJob.lastPolledAtMs > 5 * 60_000
+          ) {
+            oldJob.terminate(true);
+            autoReapedWatchers += 1;
+          }
+        }
+      }
+
       const job = startBackgroundJob(command, cwd, timeoutMs);
       await waitForJob(job, waitMs);
       return formatJobResult(job, 0);
@@ -2282,7 +2538,9 @@ export const tools: ToolDef[] = [
       const pattern = args.pattern as string;
       const { target, extractedGlob } = resolveTargetAndTrailingGlob(args.path as string | undefined);
       const globs = [...((args.globs as string[] | undefined) ?? []), ...(extractedGlob ? [extractedGlob] : [])];
-      const fixedStrings = (args.fixed_strings as boolean | undefined) ?? false;
+      const autoLiteralBrackets =
+        args.fixed_strings === undefined && (/\[[ \t]\]|\[\]/.test(pattern) || /^\s*(?:[-*+]\s+)?\[[ xX]?\]\s*$/.test(pattern));
+      const fixedStrings = ((args.fixed_strings as boolean | undefined) ?? false) || autoLiteralBrackets;
       const caseSensitive = args.case_sensitive as boolean | undefined;
       const hidden = (args.hidden as boolean | undefined) ?? false;
       const contextLines = (args.context_lines as number | undefined) ?? 0;
@@ -2335,9 +2593,11 @@ export const tools: ToolDef[] = [
 
       const modeLabel = usedFallbackFixedStrings
         ? "fixed_strings_fallback (regex invalido tratado como texto literal)"
-        : fixedStrings
-          ? "fixed_strings"
-          : "regex";
+        : autoLiteralBrackets
+          ? "fixed_strings_auto (colchetes literais detectados automaticamente)"
+          : fixedStrings
+            ? "fixed_strings"
+            : "regex";
 
       // No ripgrep, exit code 1 sem stderr significa apenas "nenhuma ocorrencia encontrada".
       if (execution.exitCode === 1 && !execution.stderr.trim()) {
@@ -2468,74 +2728,185 @@ export const tools: ToolDef[] = [
       const allTermsAreStrictGlobs = patternTerms.length > 0 && patternTerms.every((t) => /[*?[\]{}]/.test(t));
       const canPushPatternToRg = patternTerms.length > 0 && patternTerms.every((t) => !t.startsWith("!"));
 
-      const rgArgs: string[] = ["--files", "--color=never"];
-      if (hidden) {
-        rgArgs.push("--hidden");
-      }
-      if (maxDepth !== undefined) {
-        rgArgs.push(`--max-depth=${maxDepth}`);
-      }
-      rgArgs.push(...buildSearchIgnoreGlobs(target, globs));
-      for (const glob of globs) {
-        rgArgs.push(`--glob=${glob}`);
-      }
-      if (canPushPatternToRg) {
-        const flag = caseSensitive ? "--glob" : "--iglob";
+      // v1.4.9: usa o cache estrutural de diretorios (mtimeMs) para:
+      // 1) identificar diretorios de 1o nivel que casam diretamente com pattern (ex.: nomes de worktrees em /root/repos/work);
+      // 2) podar os alvos do ripgrep quando o padrao especifica prefixos de worktrees ou um subconjunto restrito em /root/repos/work.
+      const dirIdx = getCachedDirectoryIndex(target);
+      const matchingTopDirs: string[] = [];
+      let scopedSearchTargets: string[] | null = null;
+      if (dirIdx && patternTerms.length > 0) {
+        for (const dName of dirIdx.dirNames) {
+          if (DEFAULT_SEARCH_IGNORE_DIRS.includes(dName)) continue;
+          if (dName === "work" && target === "/root/repos") continue;
+          if (patternTerms.some((term) => !term.includes("/") && matchesFindTerm(dName, term, caseSensitive))) {
+            matchingTopDirs.push(path.join(target, dName) + path.sep);
+          }
+        }
+        const candidateSubdirs = new Set<string>();
+        let allTermsScopedToSubdirs = true;
         for (const term of patternTerms) {
-          const hasGlob = /[*?[\]{}]/.test(term);
-          if (hasGlob) {
-            const normalizedGlob = normalizeFindGlob(term);
-            rgArgs.push(`${flag}=${normalizedGlob}`);
-            if (!term.includes("/") && term.startsWith("*") && term.endsWith("*")) {
-              rgArgs.push(`${flag}=**/${normalizedGlob}/**`);
+          const cleanTerm = term.replace(/^\/+|\/+$/g, "");
+          if (cleanTerm.includes("/")) {
+            const firstSeg = cleanTerm.split("/")[0];
+            if (firstSeg && firstSeg !== "**" && firstSeg !== "*") {
+              const matched = dirIdx.dirNames.filter((d) => matchesFindTerm(d, firstSeg, caseSensitive));
+              if (matched.length > 0 && matched.length <= 40) {
+                for (const m of matched) candidateSubdirs.add(path.join(target, m));
+                continue;
+              }
             }
-          } else {
-            const clean = term.replace(/^\/+|\/+$/g, "");
-            if (clean) {
-              if (clean.includes("/")) {
-                rgArgs.push(`${flag}=**/*${clean}*`);
-                rgArgs.push(`${flag}=**/*${clean}*/**`);
-              } else {
-                rgArgs.push(`${flag}=*${clean}*`);
-                rgArgs.push(`${flag}=**/*${clean}*/**`);
+          } else if (dirIdx.dirNames.length >= 20) {
+            const matched = dirIdx.dirNames.filter((d) => matchesFindTerm(d, cleanTerm, caseSensitive));
+            if (matched.length > 0 && matched.length <= 35 && matched.length < dirIdx.dirNames.length / 4) {
+              for (const m of matched) candidateSubdirs.add(path.join(target, m));
+              continue;
+            }
+          }
+          allTermsScopedToSubdirs = false;
+          break;
+        }
+        if (allTermsScopedToSubdirs && candidateSubdirs.size > 0 && candidateSubdirs.size <= 40) {
+          scopedSearchTargets = Array.from(candidateSubdirs);
+        }
+      }
+
+      const buildFindRgArgs = (
+        searchTargets: string[],
+        noIgnoreVcs = false,
+        overrideMaxDepth?: number,
+        primaryTargetForIgnore = target,
+      ): string[] => {
+        const rgArgs: string[] = ["--files", "--color=never"];
+        if (hidden) {
+          rgArgs.push("--hidden");
+        }
+        if (noIgnoreVcs) {
+          rgArgs.push("--no-ignore-vcs");
+        }
+        const effectiveDepth = overrideMaxDepth ?? maxDepth;
+        if (effectiveDepth !== undefined) {
+          rgArgs.push(`--max-depth=${effectiveDepth}`);
+        }
+        rgArgs.push(...buildSearchIgnoreGlobs(primaryTargetForIgnore, globs));
+        for (const glob of globs) {
+          rgArgs.push(`--glob=${glob}`);
+        }
+        if (canPushPatternToRg) {
+          const flag = caseSensitive ? "--glob" : "--iglob";
+          for (const term of patternTerms) {
+            const hasGlob = /[*?[\]{}]/.test(term);
+            if (hasGlob) {
+              const normalizedGlob = normalizeFindGlob(term);
+              rgArgs.push(`${flag}=${normalizedGlob}`);
+              if (!term.includes("/") && term.startsWith("*") && term.endsWith("*")) {
+                rgArgs.push(`${flag}=**/${normalizedGlob}/**`);
+              }
+            } else {
+              const clean = term.replace(/^\/+|\/+$/g, "");
+              if (clean) {
+                if (clean.includes("/")) {
+                  rgArgs.push(`${flag}=**/*${clean}*`);
+                  rgArgs.push(`${flag}=**/*${clean}*/**`);
+                } else {
+                  rgArgs.push(`${flag}=*${clean}*`);
+                  rgArgs.push(`${flag}=**/*${clean}*/**`);
+                }
               }
             }
           }
         }
-      }
-      rgArgs.push("--", target);
+        rgArgs.push("--", ...searchTargets);
+        return rgArgs;
+      };
 
-      const execution = await executeRipgrep(rgArgs, os.homedir());
-      // No rg --files, exit code 1 sem stderr ocorre quando nenhum arquivo casa com os globs.
+      const filterMatchedFiles = (rawStdout: string, baseTarget = target): string[] => {
+        const rawLines = rawStdout.replace(/\r?\n$/, "");
+        let list = rawLines ? rawLines.split("\n") : [];
+        if (patternTerms.length > 0 && !allTermsAreStrictGlobs) {
+          list = list.filter((filePath) => {
+            const rel = filePath.startsWith(baseTarget + path.sep) ? filePath.slice(baseTarget.length + 1) : filePath;
+            return patternTerms.some((term) => matchesFindTerm(rel, term, caseSensitive));
+          });
+        }
+        return list;
+      };
+
+      const targetsVcsIgnoredArtifacts =
+        rawPattern !== undefined && /\b(ledger\.md|\.sdd|\.superpowers)\b/i.test(rawPattern);
+
+      let execution = await executeRipgrep(
+        buildFindRgArgs(scopedSearchTargets ?? [target], targetsVcsIgnoredArtifacts),
+        os.homedir(),
+      );
       if (execution.exitCode !== 0 && !(execution.exitCode === 1 && !execution.stderr.trim())) {
         const errText = execution.stderr.trim() || execution.errorMessage || `ripgrep --files falhou com codigo ${execution.exitCode}`;
         throw new Error(`Erro ao executar find_files (rg --files): ${errText}`);
       }
 
-      const rawLines = execution.stdout.replace(/\r?\n$/, "");
-      let files = rawLines ? rawLines.split("\n") : [];
+      let files = filterMatchedFiles(execution.stdout);
 
-      if (patternTerms.length > 0 && !allTermsAreStrictGlobs) {
-        files = files.filter((filePath) => {
-          const rel = filePath.startsWith(target + path.sep) ? filePath.slice(target.length + 1) : filePath;
-          return patternTerms.some((term) => matchesFindTerm(rel, term, caseSensitive));
-        });
+      // Se a poda por subdiretorios de worktree retornou 0 arquivos, faz fallback para o diretorio completo.
+      if (files.length === 0 && scopedSearchTargets !== null) {
+        const fullExec = await executeRipgrep(buildFindRgArgs([target], targetsVcsIgnoredArtifacts), os.homedir());
+        if (fullExec.exitCode === 0 || (fullExec.exitCode === 1 && !fullExec.stderr.trim())) {
+          files = filterMatchedFiles(fullExec.stdout);
+        }
+      }
+
+      // v1.4.9: se 0 arquivos foram encontrados, tenta com --no-ignore-vcs (mantendo exclusao de node_modules/dist/etc.)
+      // para encontrar artefatos listados em .git/info/exclude ou .gitignore local (como .sdd/ledger.md).
+      if (files.length === 0 && !targetsVcsIgnoredArtifacts && patternTerms.length > 0) {
+        const noIgnoreExec = await executeRipgrep(
+          buildFindRgArgs(scopedSearchTargets ?? [target], true),
+          os.homedir(),
+        );
+        if (noIgnoreExec.exitCode === 0 || (noIgnoreExec.exitCode === 1 && !noIgnoreExec.stderr.trim())) {
+          files = filterMatchedFiles(noIgnoreExec.stdout);
+        }
+      }
+
+      // Se a busca partiu de /root/repos e retornou 0 arquivos fora de work/, verifica /root/repos/work (max_depth=3).
+      if (
+        files.length === 0 &&
+        target === "/root/repos" &&
+        patternTerms.length > 0 &&
+        existsSync("/root/repos/work")
+      ) {
+        const workExec = await executeRipgrep(
+          buildFindRgArgs(["/root/repos/work"], true, explicitMaxDepth ?? 3, "/root/repos/work"),
+          os.homedir(),
+        );
+        if (workExec.exitCode === 0 || (workExec.exitCode === 1 && !workExec.stderr.trim())) {
+          files = filterMatchedFiles(workExec.stdout, "/root/repos/work");
+        }
       }
 
       files.sort((a, b) => entryCollator.compare(a, b));
       const truncated = files.length > maxResults;
       const selected = truncated ? files.slice(0, maxResults) : files;
+      const topDirsPreview =
+        matchingTopDirs.length > 0
+          ? `matching_directories: ${matchingTopDirs.length} (${matchingTopDirs.slice(0, 20).join(", ")}${matchingTopDirs.length > 20 ? ", ..." : ""})`
+          : "";
 
       const header = [
         `exit_code: 0`,
         `path: ${target}`,
         `pattern: ${rawPattern || "*"}`,
+        topDirsPreview,
         `returned_files: ${selected.length}`,
         `total_files: ${files.length}`,
         `truncated: ${truncated}`,
-      ].join("\n");
+      ]
+        .filter(Boolean)
+        .join("\n");
 
-      const body = selected.length > 0 ? selected.join("\n") : "(nenhum arquivo encontrado)";
+      const body =
+        selected.length > 0
+          ? selected.join("\n")
+          : matchingTopDirs.length > 0
+            ? matchingTopDirs.slice(0, maxResults).join("\n")
+            : "(nenhum arquivo encontrado)";
       return commandResult(`${header}\n\n${body}`);
     },
   },
@@ -2600,6 +2971,7 @@ export const tools: ToolDef[] = [
       const target = resolvePath(args.path as string);
       await fs.mkdir(path.dirname(target), { recursive: true });
       await fs.writeFile(target, args.content as string, "utf8");
+      invalidateFileCache(target);
       return textResult(`Arquivo gravado: ${target} (${(args.content as string).length} caracteres).`);
     },
   },
@@ -2634,6 +3006,7 @@ export const tools: ToolDef[] = [
             const replacementStr = normalized.adjustedNewStr ?? newStr;
             const updatedNormalized = `${content.slice(0, normalized.index)}${replacementStr}${content.slice(normalized.index + normalized.length)}`;
             await fs.writeFile(target, updatedNormalized, "utf8");
+            invalidateFileCache(target);
             return textResult(`Arquivo editado: ${target} (1 substituicao(oes)).`);
           }
           if (newStr.trim().length >= 15 && countOccurrences(content, newStr).count === 1) {
@@ -2665,6 +3038,7 @@ export const tools: ToolDef[] = [
         ? content.replaceAll(oldStr, newStr)
         : `${content.slice(0, firstIndex)}${newStr}${content.slice(firstIndex + oldStr.length)}`;
       await fs.writeFile(target, updated, "utf8");
+      invalidateFileCache(target);
       return textResult(`Arquivo editado: ${target} (${replaceAll ? occurrences : 1} substituicao(oes)).`);
     },
   },
@@ -2744,6 +3118,7 @@ export const tools: ToolDef[] = [
           }
           continue;
         }
+        let targetReplaceIndex = firstIndex;
         if (occurrences > 1 && !replaceAll) {
           const remainingSameOldStringEdits = edits
             .slice(i)
@@ -2754,15 +3129,46 @@ export const tools: ToolDef[] = [
                 candidate.old_string !== candidate.new_string,
             ).length;
           if (remainingSameOldStringEdits !== occurrences) {
-            if (failures.length < 4) {
-              const lineNums = findOccurrenceLines(updated, edit.old_string);
-              const linesLabel = lineNums.length > 0 ? ` (linhas ${lineNums.join(", ")}${occurrences > lineNums.length ? ", ..." : ""})` : "";
-              const contextHint = buildMultipleOccurrencesHint(updated, lineNums, countLines(edit.old_string));
-              failures.push(
-                `${editPrefix}: old_string aparece ${occurrences} vezes em ${target}${linesLabel}. Inclua linhas vizinhas para torna-lo unico ou use replace_all=true. Nenhuma alteracao foi gravada.${contextHint}`,
-              );
+            // v1.4.9: desambiguacao entre edicoes do mesmo lote — se outras ocorrencias de edit.old_string
+            // estao contidas dentro de old_strings mais especificos de edicoes posteriores do lote e resta
+            // exatamente 1 ocorrencia livre, aplica nesta ocorrencia livre.
+            const occPositions: number[] = [];
+            let searchPos = 0;
+            while ((searchPos = updated.indexOf(edit.old_string, searchPos)) !== -1) {
+              occPositions.push(searchPos);
+              searchPos += edit.old_string.length;
             }
-            continue;
+            const claimedRanges: Array<{ start: number; end: number }> = [];
+            for (let j = i + 1; j < edits.length; j += 1) {
+              const otherOld = edits[j].old_string;
+              if (otherOld.length > edit.old_string.length && otherOld.includes(edit.old_string)) {
+                let p = 0;
+                while ((p = updated.indexOf(otherOld, p)) !== -1) {
+                  claimedRanges.push({ start: p, end: p + otherOld.length });
+                  p += otherOld.length;
+                }
+              }
+            }
+            const unclaimed =
+              claimedRanges.length > 0
+                ? occPositions.filter(
+                    (pos) =>
+                      !claimedRanges.some((r) => pos >= r.start && pos + edit.old_string.length <= r.end),
+                  )
+                : occPositions;
+            if (unclaimed.length === 1) {
+              targetReplaceIndex = unclaimed[0];
+            } else {
+              if (failures.length < 4) {
+                const lineNums = findOccurrenceLines(updated, edit.old_string);
+                const linesLabel = lineNums.length > 0 ? ` (linhas ${lineNums.join(", ")}${occurrences > lineNums.length ? ", ..." : ""})` : "";
+                const contextHint = buildMultipleOccurrencesHint(updated, lineNums, countLines(edit.old_string));
+                failures.push(
+                  `${editPrefix}: old_string aparece ${occurrences} vezes em ${target}${linesLabel}. Inclua linhas vizinhas para torna-lo unico ou use replace_all=true. Nenhuma alteracao foi gravada.${contextHint}`,
+                );
+              }
+              continue;
+            }
           }
         }
         if (
@@ -2778,7 +3184,7 @@ export const tools: ToolDef[] = [
         }
         updated = replaceAll
           ? updated.replaceAll(edit.old_string, edit.new_string)
-          : `${updated.slice(0, firstIndex)}${edit.new_string}${updated.slice(firstIndex + edit.old_string.length)}`;
+          : `${updated.slice(0, targetReplaceIndex)}${edit.new_string}${updated.slice(targetReplaceIndex + edit.old_string.length)}`;
         totalReplacements += replaceAll ? occurrences : 1;
         passedEditNumbers.push(i + 1);
       }
@@ -2793,6 +3199,7 @@ export const tools: ToolDef[] = [
       }
 
       await fs.writeFile(target, updated, "utf8");
+      invalidateFileCache(target);
       return textResult(
         `Arquivo editado: ${target} (${edits.length} bloco(s) aplicados, ${totalReplacements} substituicao(oes) no total).`,
       );
@@ -2926,6 +3333,8 @@ export const tools: ToolDef[] = [
       const dest = resolvePath(args.destination as string);
       await fs.mkdir(path.dirname(dest), { recursive: true });
       await fs.rename(src, dest);
+      invalidateFileCache(src);
+      invalidateFileCache(dest);
       return textResult(`Movido: ${src} -> ${dest}.`);
     },
   },
@@ -2962,6 +3371,7 @@ export const tools: ToolDef[] = [
             const entries = await fs.readdir(target);
             if (entries.length === 0) {
               await fs.rmdir(target);
+              invalidateFileCache(target);
               return textResult(`Excluido: ${target}.`);
             }
             throw new Error(
@@ -2975,6 +3385,7 @@ export const tools: ToolDef[] = [
         }
       }
       await fs.rm(target, { recursive, force: false });
+      invalidateFileCache(target);
       return textResult(`Excluido: ${target}.`);
     },
   },

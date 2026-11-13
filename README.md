@@ -6,8 +6,8 @@ Servidor **MCP (Model Context Protocol)** via **Streamable HTTP** que dá a um a
 
 A documentação completa está organizada em [`docs/README.md`](docs/README.md).
 
-- [`docs/ARQUITETURA.md`](docs/ARQUITETURA.md) — componentes, autenticação, sessões, persistência e fluxos.
-- [`docs/FERRAMENTAS.md`](docs/FERRAMENTAS.md) — contrato das 16 ferramentas MCP, matriz de decisão e padrões de uso.
+- [`docs/ARQUITETURA.md`](docs/ARQUITETURA.md) — componentes, autenticação, sessões, cache zero-stale, persistência e fluxos.
+- [`docs/FERRAMENTAS.md`](docs/FERRAMENTAS.md) — contrato das 17 ferramentas MCP, matriz de decisão e padrões de uso.
 - [`docs/OPERACAO.md`](docs/OPERACAO.md) — runbook, variáveis de ambiente e diagnóstico.
 - [`docs/SEGURANCA.md`](docs/SEGURANCA.md) — fronteiras de confiança, riscos e hardening.
 - [`docs/DESENVOLVIMENTO.md`](docs/DESENVOLVIMENTO.md) — estrutura do código, testes e workflow de alteração.
@@ -35,29 +35,30 @@ mcp-dev-agent  (Express + Streamable HTTP, porta 3000)
   - **Bearer token estático** via header `Authorization` (variável `MCP_AUTH_TOKEN`) — usado pelo Copilot Studio.
   - **OAuth 2.1** conforme a spec de autorização do MCP (Dynamic Client Registration, authorization code + PKCE, refresh token) — exigido pelo ChatGPT. Endpoints: `/.well-known/oauth-authorization-server`, `/.well-known/oauth-protected-resource/mcp`, `/authorize`, `/token`, `/register`, `/revoke`. A aprovação pede a senha `OAUTH_APPROVAL_PASSWORD` (fallback: `MCP_AUTH_TOKEN`). Clients e tokens ficam em `data/oauth-state.json` (fora do versionamento, `chmod 600`); implementação em `src/oauth.ts`.
 - **Escopo de arquivos:** sem restrição de path — o agente opera em qualquer caminho permitido ao usuário Linux do serviço (decisão de projeto). Resolve `~` e caminhos relativos.
-- **Auditoria e Monitoramento em Tempo Real (`/logs`):** cada execução de ferramenta (`tools/call` validado) gera evento JSON estruturado com sessão/client, duração, argumentos sanitizados e resumo do resultado. Além de `stderr`/journald e `MCP_AUDIT_LOG_PATH`, o painel `/logs` exibe conexões ativas e transações em tempo real via SSE (`/logs/stream`).
+- **Auditoria, Cache Zero-Stale e Monitoramento em Tempo Real (`/logs`):** cada execução de ferramenta (`tools/call` validado) gera evento JSON estruturado com sessão/client, duração, argumentos sanitizados e resumo do resultado. O painel `/logs` exibe conexões ativas, transações em tempo real via SSE (`/logs/stream`), alertas de inatividade e aba de KPI's qualitativos com comparativo histórico entre versões. O servidor conta com 3 módulos internos de cache *zero-stale* (índice de diretórios/worktrees validado por `statSync().mtimeMs`, cache LRU de paginação de leitura validado por `(mtimeMs, size)` + invalidação imediata em escritas, e cache de agregação de janelas de KPIs por `kpiMutationSeq`).
 - **Proxy:** `trust proxy=loopback` por padrão, adequado ao `cloudflared` local; outras topologias podem ajustar `MCP_TRUST_PROXY`.
 
-## Ferramentas expostas (16 ferramentas)
+## Ferramentas expostas (17 ferramentas)
 
 | Ferramenta | O que faz |
 |---|---|
-| `find_files` | Localiza caminhos de arquivos rapidamente por substring ou glob (`rg --files`) sem ler o conteúdo interno, ignorando `node_modules`/`.git`/`.next`/`dist`/`build`/`coverage`. |
-| `search_code` | Busca código com `ripgrep` (`rg`) nativo sem subir bash, ignorando `node_modules`/`.git`/`.next`/`dist` por padrão e com fallback automático para texto literal se o regex for inválido. |
-| `read_file` | Lê texto por linhas ou por caracteres, com bloqueio automático de arquivos binários e limite de tamanho (`MCP_MAX_TEXT_FILE_BYTES`). |
-| `read_files` | Lê de 1 a 20 arquivos de texto em paralelo numa única chamada, reduzindo round-trips. |
-| `edit_file` | Substituição de texto exato (`old_string` → `new_string`, com `replace_all`) e diagnóstico contextual de linhas em caso de falha. |
-| `multi_edit_file` | Aplica múltiplas substituições exatas no mesmo arquivo de forma atômica (se uma falhar, nenhuma é gravada), com diagnóstico contextual. |
-| `write_file` | Cria ou sobrescreve um arquivo (cria diretórios pais). |
+| `stat_path` | Verifica a existência, tipo (`file`, `directory`, `symlink`, `missing`), tamanho e `mtime` de 1 a 30 caminhos em uma única chamada sem gerar erro `ENOENT` (com sugestões automáticas de nomes similares). |
+| `find_files` | Localiza caminhos de arquivos ou worktrees rapidamente por substring ou glob (`rg --files`) com poda inteligente de worktrees, fallback `--no-ignore-vcs` para `.sdd`/`.superpowers` e listagem de `matching_directories`. |
+| `search_code` | Busca código com `ripgrep` (`rg`) nativo sem subir bash, ignorando `node_modules`/`.git`/`.next`/`dist` por padrão, com auto-detecção de colchetes literais (`[ ]`) e fallback automático para texto literal se o regex for inválido. |
+| `read_file` | Lê texto por linhas ou por caracteres (com cache LRU zero-stale validado por `mtimeMs + size` e opção `allow_missing=true`), bloqueio automático de arquivos binários e limite de tamanho (`MCP_MAX_TEXT_FILE_BYTES`). |
+| `read_files` | Lê de 1 a 20 arquivos de texto (ou múltiplas faixas `offset`/`limit` do mesmo arquivo) em paralelo numa única chamada, reduzindo round-trips. |
+| `edit_file` | Substituição de texto exato (`old_string` → `new_string`, com `replace_all`), normalização inteligente de espaços/indentação/escapes Bash e diagnóstico contextual de linhas em caso de falha. |
+| `multi_edit_file` | Aplica múltiplas substituições exatas no mesmo arquivo de forma atômica (com desambiguação *batch-aware* de ocorrências e validação de todos os blocos de uma vez). |
+| `write_file` | Cria ou sobrescreve um arquivo (cria diretórios pais e invalida imediatamente o cache de leitura). |
 | `run_command` | Executa shell síncrono (bash) com `cwd`/`timeout` para comandos rápidos (< 15-30s). Saídas grandes recebem prévia início + fim e `artifact_id`. |
 | `read_command_output` | Lê, por `offset`/`limit`, qualquer trecho de uma saída grande preservada por `run_command`, `start_command`, `search_code` ou `find_files`. |
-| `start_command` | Inicia comando longo em background (builds, testes E2E/Playwright, deploys, subagentes CLI) e retorna `job_id` sem risco de timeout HTTP/Cloudflare. |
-| `poll_command` | Consulta status, lê novas saídas incrementais (`offset=next_offset`) ou encerra (`kill=true`) um job iniciado por `start_command`. |
+| `start_command` | Inicia comando longo em background (builds, testes E2E/Playwright, deploys, subagentes CLI) com coalescência (re-attach) automática de processos idênticos em execução e limpeza de watchers órfãos. |
+| `poll_command` | Consulta status, lê novas saídas incrementais (`offset=next_offset`), corrige typos de `job_id` / faz fallback para job único ativo ou encerra (`kill=true`) um job iniciado por `start_command`. |
 | `read_image` | Lê PNG/JPEG/GIF/WebP e retorna **ImageContent MCP nativo** + path, MIME, bytes, dimensões quando detectáveis e SHA-256. |
-| `list_directory` | Lista entradas com paginação (`offset`, `limit`, `has_more`, `next_offset`) e profundidade recursiva opcional (`max_depth` de 1 a 4). |
+| `list_directory` | Lista entradas com paginação (`offset`, `limit`, `has_more`, `next_offset`), filtro `pattern` e profundidade recursiva opcional (`max_depth` de 1 a 4). |
 | `move_file` | Move ou renomeia arquivo/diretório. |
 | `make_directory` | `mkdir -p`. |
-| `delete_path` | Exclui arquivo ou diretório (`recursive` para diretórios). |
+| `delete_path` | Exclui arquivo ou diretório (`recursive` para diretórios não vazios). |
 
 `run_command` e `start_command` cobrem qualquer operação de shell; as ferramentas dedicadas (`find_files`, `search_code`, `read_files`, `multi_edit_file`, `read_image`) reduzem round-trips e tornam leitura, busca, edição e transporte de artefatos muito mais rápidos e confiáveis para o agente.
 

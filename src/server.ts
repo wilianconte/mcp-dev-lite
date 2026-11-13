@@ -12,7 +12,7 @@ import {
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { tools } from "./tools.js";
 import { DevAgentOAuthProvider } from "./oauth.js";
-import { auditLogPath, auditToolCall } from "./audit.js";
+import { MCP_SERVER_VERSION, auditLogPath, auditToolCall } from "./audit.js";
 import { McpMonitor } from "./monitor.js";
 
 const PORT = Number(process.env.PORT ?? 3000);
@@ -61,11 +61,11 @@ const toolDescriptors = tools.map((tool) => ({
 /** Cria uma instancia do servidor MCP com todas as ferramentas registradas. */
 function buildServer(context: AuditRequestContext = {}): McpServer {
   const server = new McpServer(
-    { name: "mcp-dev-agent", version: "1.4.8" },
+    { name: "mcp-dev-agent", version: MCP_SERVER_VERSION },
     {
       instructions:
         "Servidor de desenvolvimento na VM (17 ferramentas). Siga estas diretrizes de escolha de ferramentas para maxima performance:\n" +
-        "1. LOCALIZACAO E EXISTENCIA DE CAMINHOS: Para checar se 1 ou mais arquivos/diretorios existem (sem erro ENOENT), use stat_path (ou read_file com allow_missing=true). Use find_files para localizar arquivos por nome, substring ou glob, aceitando alternancia com '|' (ex.: pattern='sidebar', pattern='*inbox*|*media*|*.spec.ts', max_depth=1..10) e list_directory (com pattern opcional para filtrar por nome/glob e max_depth de 1 a 4) para explorar a estrutura de pastas. Nunca use find/ls/test via run_command.\n" +
+        "1. LOCALIZACAO E EXISTENCIA DE CAMINHOS: Para checar se 1 ou mais arquivos/diretorios existem (sem erro ENOENT), use stat_path (ou read_file com allow_missing=true). Use find_files para localizar arquivos ou worktrees por nome, substring ou glob, aceitando alternancia com '|' (ex.: pattern='sidebar', pattern='*inbox*|*media*|*.spec.ts', max_depth=1..10; tambem lista diretorios de topo correspondentes e busca automaticamente em .sdd/.superpowers) e list_directory (com pattern opcional para filtrar por nome/glob e max_depth de 1 a 4) para explorar a estrutura de pastas. Nunca use find/ls/test via run_command.\n" +
         "2. BUSCA EM CODIGO: Use SEMPRE search_code (ripgrep nativo) para buscar texto/regex dentro de arquivos. Passe o path mais especifico possivel (ex.: '/root/repos/app/src') e use fixed_strings=true ao buscar trechos literais com (), {}, [] ou $.\n" +
         "3. LEITURA DE ARQUIVOS: Para 1 arquivo use read_file (use allow_missing=true se o arquivo puder nao existir); para 2 a 20 arquivos (ou 2 ou mais faixas offset/limit distantes do mesmo arquivo grande) use read_files em lote (leitura paralela). Evite cat/head/tail/sed via run_command. Arquivos binarios sao bloqueados automaticamente.\n" +
         "4. EDICAO DE ARQUIVOS: Para alterar 1 trecho use edit_file; para alterar 2 ou mais trechos no mesmo arquivo use multi_edit_file (atomico); para criar/sobrescrever o arquivo inteiro use write_file.\n" +
@@ -395,7 +395,9 @@ app.get("/mcp", handleSession);
 app.delete("/mcp", handleSession);
 
 // Health check simples (sem auth) para probes de infraestrutura.
-app.get("/health", (_req, res) => res.json({ status: "ok", tools: tools.map((t) => t.name) }));
+app.get("/health", (_req, res) =>
+  res.json({ status: "ok", version: MCP_SERVER_VERSION, tools: tools.map((t) => t.name) }),
+);
 
 app.listen(PORT, HOST, () => {
   console.log(`MCP dev-agent ouvindo em http://${HOST}:${PORT}/mcp`);

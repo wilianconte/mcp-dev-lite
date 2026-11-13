@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, rm, writeFile, mkdir, readFile, stat } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { tools } from '../dist/tools.js';
+import { tools, getInternalCacheStats } from '../dist/tools.js';
 
 const tool = (name) => {
   const found = tools.find((item) => item.name === name);
@@ -965,6 +965,161 @@ test('v1.4.8: fallback de job unico em poll_command, normalizacao de contra-barr
 
     await tool('poll_command').handler({ job_id: realJobId, kill: true });
   } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('v1.4.9: cache zero-stale (FileLRU + WorktreeDirIndex), desambiguacao batch-aware em multi_edit_file, aspas escapadas Bash, find_files .sdd/diretorios, search_code auto-literal "[ ]" e coalescencia em start_command', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'mcp-dev-test-v149-'));
+  const prevWorktreesRoot = process.env.MCP_WORKTREES_ROOT;
+  try {
+    // 1. Cache Zero-Stale de Paginacao de Arquivos (FileContentPaginationLruCache) + invalidacao automatica em edit_file
+    const pagedFile = path.join(root, 'paged.txt');
+    const lines = Array.from({ length: 120 }, (_, i) => `linha_${i + 1}_conteudo`);
+    await writeFile(pagedFile, lines.join('\n'), 'utf8');
+
+    const beforeStats = getInternalCacheStats();
+    const r1 = await tool('read_file').handler({ path: pagedFile, offset: 1, limit: 30 });
+    assert.match(textOf(r1), /linha_1_conteudo/);
+    const afterFirstRead = getInternalCacheStats();
+    assert.equal(afterFirstRead.fileLruMisses, beforeStats.fileLruMisses + 1);
+
+    const r2 = await tool('read_file').handler({ path: pagedFile, offset: 31, limit: 30 });
+    assert.match(textOf(r2), /linha_31_conteudo/);
+    const afterSecondRead = getInternalCacheStats();
+    assert.equal(afterSecondRead.fileLruHits, afterFirstRead.fileLruHits + 1);
+
+    // Editar o arquivo deve invalidar imediatamente o cache LRU (zero stale read)
+    await tool('edit_file').handler({
+      path: pagedFile,
+      old_string: 'linha_31_conteudo',
+      new_string: 'linha_31_MODIFICADA',
+    });
+    const r3 = await tool('read_file').handler({ path: pagedFile, offset: 31, limit: 5 });
+    assert.match(textOf(r3), /linha_31_MODIFICADA/);
+
+    // 2. resolvePath: autocorrecao de barra espuria em nomes de worktree (ex.: work/deploy/apim-wp018 -> work/deploy-apim-wp018)
+    const fakeWorkRoot = path.join(root, 'work');
+    const wtDir = path.join(fakeWorkRoot, 'deploy-apim-wp018', 'sub');
+    await mkdir(wtDir, { recursive: true });
+    const wtFile = path.join(wtDir, 'proof.yml');
+    await writeFile(wtFile, 'kind: ConfigMap\n', 'utf8');
+    process.env.MCP_WORKTREES_ROOT = fakeWorkRoot;
+
+    const splitSlashPath = path.join(fakeWorkRoot, 'deploy', 'apim-wp018', 'sub', 'proof.yml');
+    const wtRead = await tool('read_file').handler({ path: splitSlashPath });
+    assert.match(textOf(wtRead), /kind: ConfigMap/);
+
+    // 3. find_files: retorno de matching_directories + busca automatica em .sdd ignorado pelo .gitignore (--no-ignore-vcs)
+    const repoDir = path.join(fakeWorkRoot, 'portal-sdd-wt');
+    await mkdir(path.join(repoDir, '.git'), { recursive: true });
+    await mkdir(path.join(repoDir, '.sdd', 'changes', 'chg-01'), { recursive: true });
+    await writeFile(path.join(repoDir, '.gitignore'), '.sdd/\n', 'utf8');
+    await writeFile(path.join(repoDir, '.sdd', 'ledger.md'), '# Ledger SDD\n', 'utf8');
+
+    const findDirsRes = await tool('find_files').handler({
+      path: fakeWorkRoot,
+      pattern: '*apim*|*portal*',
+      max_depth: 2,
+    });
+    assert.match(textOf(findDirsRes), /matching_directories: 2[\s\S]*deploy-apim-wp018\/[\s\S]*portal-sdd-wt\//);
+
+    const findSddRes = await tool('find_files').handler({
+      path: repoDir,
+      pattern: '*.sdd*|*ledger.md*',
+    });
+    assert.match(textOf(findSddRes), /\.sdd\/ledger\.md/);
+
+    // 4. search_code: auto-deteccao de colchetes literais "[ ]" (fixed_strings_auto)
+    const tasksMd = path.join(root, 'TASKS.md');
+    await writeFile(
+      tasksMd,
+      [
+        '# Tarefas',
+        '- [x] Concluida com espacos normais',
+        '- [ ] Pendente unica no arquivo',
+      ].join('\n'),
+      'utf8',
+    );
+    const searchBracketRes = await tool('search_code').handler({
+      path: tasksMd,
+      pattern: '[ ]',
+    });
+    const searchBracketText = textOf(searchBracketRes);
+    assert.match(searchBracketText, /fixed_strings_auto/);
+    assert.match(searchBracketText, /Pendente unica no arquivo/);
+    assert.doesNotMatch(searchBracketText, /Concluida com espacos normais/);
+
+    // 5. multi_edit_file: desambiguacao batch-aware quando ocorrencia duplicada e reivindicada por edicao mais especifica no mesmo lote
+    const ledgerFile = path.join(root, 'LEDGER.md');
+    await writeFile(
+      ledgerFile,
+      [
+        '### WP-017',
+        '- Estado: `EXECUTING`',
+        '- Evidencia: pendente',
+        '',
+        '### WP-018',
+        '- Estado: `EXECUTING`',
+        '- Nota especifica do WP-018',
+      ].join('\n'),
+      'utf8',
+    );
+
+    const disambigRes = await tool('multi_edit_file').handler({
+      path: ledgerFile,
+      edits: [
+        {
+          old_string: '- Estado: `EXECUTING`',
+          new_string: '- Estado: `COMPLETED`',
+        },
+        {
+          old_string: '### WP-018\n- Estado: `EXECUTING`\n- Nota especifica do WP-018',
+          new_string: '### WP-018\n- Estado: `VALIDATED`\n- Nota especifica do WP-018',
+        },
+      ],
+    });
+    assert.match(textOf(disambigRes), /2 bloco\(s\) aplicados, 2 substituicao\(oes\)/);
+    const ledgerAfter = await readFile(ledgerFile, 'utf8');
+    assert.match(ledgerAfter, /### WP-017\n- Estado: `COMPLETED`/);
+    assert.match(ledgerAfter, /### WP-018\n- Estado: `VALIDATED`/);
+
+    // 6. Passo 5 de normalizacao: permutacao de escapes de aspas em Bash (\'' vs '\'')
+    const bashQuoteFile = path.join(root, 'check-pods.sh');
+    await writeFile(
+      bashQuoteFile,
+      '#!/usr/bin/env bash\nrun_ssh "kubectl get pods -o jsonpath=\'{.items[*].metadata.name}\'"\n',
+      'utf8',
+    );
+    await tool('edit_file').handler({
+      path: bashQuoteFile,
+      old_string: 'run_ssh "kubectl get pods -o jsonpath=\'\\"{.items[*].metadata.name}\'\\""',
+      new_string: 'run_ssh "kubectl get pods -A"',
+    });
+    assert.match(await readFile(bashQuoteFile, 'utf8'), /kubectl get pods -A/);
+
+    // 7. start_command: coalescencia (re-attach) automatica quando o mesmo comando ja esta running no mesmo cwd
+    const j1 = await tool('start_command').handler({
+      command: 'printf "coalesced_job_running\\n" && sleep 15',
+      cwd: root,
+      wait_ms: 100,
+    });
+    const j1Id = textOf(j1).match(/job_id: ([0-9a-f-]{36})/)?.[1];
+    assert.ok(j1Id);
+
+    const j2 = await tool('start_command').handler({
+      command: 'printf "coalesced_job_running\\n" && sleep 15',
+      cwd: root,
+      wait_ms: 50,
+    });
+    const j2Text = textOf(j2);
+    assert.match(j2Text, new RegExp(`job_id: ${j1Id}`));
+    assert.match(j2Text, /reattached_to_running_job: true/);
+
+    await tool('poll_command').handler({ job_id: j1Id, kill: true });
+  } finally {
+    if (prevWorktreesRoot === undefined) delete process.env.MCP_WORKTREES_ROOT;
+    else process.env.MCP_WORKTREES_ROOT = prevWorktreesRoot;
     await rm(root, { recursive: true, force: true });
   }
 });

@@ -9,6 +9,7 @@ import {
   truncateString,
   type ToolResultSummary,
 } from "./audit.js";
+import { getInternalCacheStats, type InternalCacheAndControlStats } from "./tools.js";
 
 const DEFAULT_MAX_TRANSACTIONS = 500;
 const MAX_RECENT_CLOSED_SESSIONS = 50;
@@ -177,6 +178,10 @@ export interface KpiComparisonReport {
   versionCounts: Record<string, number>;
   current: KpiWindowMetrics;
   baseline: KpiWindowMetrics | null;
+  cacheStats?: InternalCacheAndControlStats & {
+    kpiCacheHits: number;
+    kpiCacheMisses: number;
+  };
 }
 
 function inferAuditVersion(rawVersion: unknown, tsMs: number): string {
@@ -317,8 +322,11 @@ const NATIVE_READ_SEARCH_TOOLS = new Set([
 
 function filterKpiEntriesByWindow(entries: KpiCallEntry[], windowKey: string, nowMs = Date.now()): { list: KpiCallEntry[]; label: string } {
   const norm = (windowKey || `v${MCP_SERVER_VERSION}`).trim();
+  if (norm === "v1.4.9" || norm === "1.4.9") {
+    return { list: entries.filter((e) => e.version === "1.4.9"), label: "Versao v1.4.9 (Atual)" };
+  }
   if (norm === "v1.4.8" || norm === "1.4.8") {
-    return { list: entries.filter((e) => e.version === "1.4.8"), label: "Versao v1.4.8 (Atual)" };
+    return { list: entries.filter((e) => e.version === "1.4.8"), label: "Versao v1.4.8 (12/nov–13/nov)" };
   }
   if (norm === "v1.4.7" || norm === "1.4.7") {
     return { list: entries.filter((e) => e.version === "1.4.7"), label: "Versao v1.4.7 (11/nov–12/nov)" };
@@ -352,7 +360,7 @@ function filterKpiEntriesByWindow(entries: KpiCallEntry[], windowKey: string, no
   if (norm === "all") {
     return { list: entries, label: "Todo o historico" };
   }
-  return { list: entries.filter((e) => e.version === "1.4.8"), label: "Versao v1.4.8 (Atual)" };
+  return { list: entries.filter((e) => e.version === "1.4.9"), label: "Versao v1.4.9 (Atual)" };
 }
 
 function computeKpiWindowMetrics(entries: KpiCallEntry[], windowKey: string, windowLabel: string): KpiWindowMetrics {
@@ -784,6 +792,14 @@ export class McpMonitor {
   private readonly transactions: TransactionRecord[] = [];
   private readonly transactionsById = new Map<string, TransactionRecord>();
   private readonly kpiEntries: KpiCallEntry[] = [];
+  private kpiMutationSeq = 0;
+  private readonly kpiWindowCache = new Map<
+    string,
+    { seq: number; computedAtMs: number; metrics: KpiWindowMetrics }
+  >();
+  private kpiVersionCountsCache: { seq: number; counts: Record<string, number> } | null = null;
+  private kpiCacheHits = 0;
+  private kpiCacheMisses = 0;
   private readonly sseClients = new Set<Response>();
   private totalTransactionsSeen = 0;
   private totalToolCallsSeen = 0;
@@ -802,6 +818,31 @@ export class McpMonitor {
     while (this.kpiEntries.length > MAX_KPI_ENTRIES) {
       this.kpiEntries.shift();
     }
+    this.kpiMutationSeq += 1;
+  }
+
+  private getCachedWindowMetrics(windowKey: string, nowMs: number): KpiWindowMetrics {
+    const isHistoricalStaticVersion =
+      /^v?1\.4\.[3-8]$|^pre-1\.4\.3$/i.test(windowKey.trim()) &&
+      windowKey.trim().replace(/^v/i, "") !== MCP_SERVER_VERSION;
+    const cached = this.kpiWindowCache.get(windowKey);
+    if (
+      cached &&
+      (cached.seq === this.kpiMutationSeq || isHistoricalStaticVersion) &&
+      (isHistoricalStaticVersion || nowMs - cached.computedAtMs < 5_000)
+    ) {
+      this.kpiCacheHits += 1;
+      return cached.metrics;
+    }
+    this.kpiCacheMisses += 1;
+    const filtered = filterKpiEntriesByWindow(this.kpiEntries, windowKey, nowMs);
+    const metrics = computeKpiWindowMetrics(filtered.list, windowKey, filtered.label);
+    this.kpiWindowCache.set(windowKey, {
+      seq: this.kpiMutationSeq,
+      computedAtMs: nowMs,
+      metrics,
+    });
+    return metrics;
   }
 
   private async readAuditLinesFromFile(targetPath: string): Promise<string[]> {
@@ -1126,30 +1167,36 @@ export class McpMonitor {
     };
   }
 
-  getKpiReport(windowKey = "v1.4.8", compareKey = "v1.4.7"): KpiComparisonReport {
+  getKpiReport(windowKey = "v1.4.9", compareKey = "v1.4.8"): KpiComparisonReport {
     const nowMs = Date.now();
-    const versionCounts: Record<string, number> = {
-      "1.4.8": 0,
-      "1.4.7": 0,
-      "1.4.6": 0,
-      "1.4.5": 0,
-      "1.4.4": 0,
-      "1.4.3": 0,
-      "pre-1.4.3": 0,
-    };
-    for (const e of this.kpiEntries) {
-      versionCounts[e.version] = (versionCounts[e.version] ?? 0) + 1;
+    let versionCounts: Record<string, number>;
+    if (this.kpiVersionCountsCache && this.kpiVersionCountsCache.seq === this.kpiMutationSeq) {
+      versionCounts = { ...this.kpiVersionCountsCache.counts };
+    } else {
+      versionCounts = {
+        "1.4.9": 0,
+        "1.4.8": 0,
+        "1.4.7": 0,
+        "1.4.6": 0,
+        "1.4.5": 0,
+        "1.4.4": 0,
+        "1.4.3": 0,
+        "pre-1.4.3": 0,
+      };
+      for (const e of this.kpiEntries) {
+        versionCounts[e.version] = (versionCounts[e.version] ?? 0) + 1;
+      }
+      this.kpiVersionCountsCache = { seq: this.kpiMutationSeq, counts: { ...versionCounts } };
     }
 
-    const currentFiltered = filterKpiEntriesByWindow(this.kpiEntries, windowKey, nowMs);
-    const currentMetrics = computeKpiWindowMetrics(currentFiltered.list, windowKey, currentFiltered.label);
+    const currentMetrics = this.getCachedWindowMetrics(windowKey, nowMs);
 
     let baselineMetrics: KpiWindowMetrics | null = null;
     if (compareKey && compareKey !== "none" && compareKey !== windowKey) {
-      const baseFiltered = filterKpiEntriesByWindow(this.kpiEntries, compareKey, nowMs);
-      baselineMetrics = computeKpiWindowMetrics(baseFiltered.list, compareKey, baseFiltered.label);
+      baselineMetrics = this.getCachedWindowMetrics(compareKey, nowMs);
     }
 
+    const internalCache = getInternalCacheStats();
     return {
       generatedAt: new Date(nowMs).toISOString(),
       currentVersion: MCP_SERVER_VERSION,
@@ -1158,6 +1205,11 @@ export class McpMonitor {
       versionCounts,
       current: currentMetrics,
       baseline: baselineMetrics,
+      cacheStats: {
+        ...internalCache,
+        kpiCacheHits: this.kpiCacheHits,
+        kpiCacheMisses: this.kpiCacheMisses,
+      },
     };
   }
 
@@ -1177,7 +1229,7 @@ export class McpMonitor {
       sessions,
       // Mais recentes primeiro na listagem inicial.
       transactions: [...this.transactions].reverse(),
-      kpis: this.getKpiReport("v1.4.8", "v1.4.7"),
+      kpis: this.getKpiReport("v1.4.9", "v1.4.8"),
     };
   }
 
@@ -1203,8 +1255,8 @@ export class McpMonitor {
 
     router.get("/logs/kpis", (req: Request, res: Response) => {
       res.setHeader("Cache-Control", "no-store");
-      const windowKey = typeof req.query.window === "string" ? req.query.window : "v1.4.8";
-      const compareKey = typeof req.query.compare === "string" ? req.query.compare : "v1.4.7";
+      const windowKey = typeof req.query.window === "string" ? req.query.window : "v1.4.9";
+      const compareKey = typeof req.query.compare === "string" ? req.query.compare : "v1.4.8";
       res.json(this.getKpiReport(windowKey, compareKey));
     });
 
@@ -2144,7 +2196,8 @@ function renderLogsDashboardHtml(): string {
       <div class="filter-controls">
         <label class="muted" style="font-size:12px;font-weight:600;text-transform:uppercase;">Janela / Versao:</label>
         <select id="kpi-window-select">
-          <option value="v1.4.8" selected>Versao Atual (v1.4.8)</option>
+          <option value="v1.4.9" selected>Versao Atual (v1.4.9)</option>
+          <option value="v1.4.8">Versao v1.4.8 (12/nov–13/nov)</option>
           <option value="v1.4.7">Versao v1.4.7 (11/nov–12/nov)</option>
           <option value="v1.4.6">Versao v1.4.6 (08/nov–10/nov)</option>
           <option value="v1.4.5">Versao v1.4.5 (06/nov–08/nov)</option>
@@ -2158,7 +2211,8 @@ function renderLogsDashboardHtml(): string {
 
         <label class="muted" style="font-size:12px;font-weight:600;text-transform:uppercase;margin-left:8px;">Comparar com:</label>
         <select id="kpi-compare-select">
-          <option value="v1.4.7" selected>Baseline v1.4.7</option>
+          <option value="v1.4.8" selected>Baseline v1.4.8</option>
+          <option value="v1.4.7">Baseline v1.4.7</option>
           <option value="v1.4.6">Baseline v1.4.6</option>
           <option value="v1.4.5">Baseline v1.4.5</option>
           <option value="v1.4.4">Baseline v1.4.4</option>
@@ -3112,8 +3166,9 @@ function renderLogsDashboardHtml(): string {
     const c = report.current;
     const b = report.baseline;
     const vc = report.versionCounts || {};
+    const cs = report.cacheStats || {};
     el('kpi-version-counts').textContent =
-      'v1.4.8: ' + (vc['1.4.8'] || 0) + ' | v1.4.7: ' + (vc['1.4.7'] || 0) + ' | v1.4.6: ' + (vc['1.4.6'] || 0) + ' | v1.4.5: ' + (vc['1.4.5'] || 0) + ' | v1.4.4: ' + (vc['1.4.4'] || 0) + ' | v1.4.3: ' + (vc['1.4.3'] || 0) + ' | pre-1.4.3: ' + (vc['pre-1.4.3'] || 0);
+      'v1.4.9: ' + (vc['1.4.9'] || 0) + ' | v1.4.8: ' + (vc['1.4.8'] || 0) + ' | v1.4.7: ' + (vc['1.4.7'] || 0) + ' | v1.4.6: ' + (vc['1.4.6'] || 0) + ' | v1.4.5: ' + (vc['1.4.5'] || 0) + ' | v1.4.4: ' + (vc['1.4.4'] || 0) + ' | v1.4.3: ' + (vc['1.4.3'] || 0) + ' | pre-1.4.3: ' + (vc['pre-1.4.3'] || 0);
 
     const sr = c.sampleReadiness;
     const rBadge = el('kpi-readiness-badge');
@@ -3250,9 +3305,9 @@ function renderLogsDashboardHtml(): string {
         mainVal: c.latency.p50LocalMs + ' / ' + c.latency.p95LocalMs + ' ms',
         delta: b ? renderDeltaBadge(c.latency.p95LocalMs, b.latency.p95LocalMs, ' ms (p95)', false) : '',
         rows: [
-          ['Execucoes locais (arquivos/busca)', c.latency.localToolCalls + ' chamadas'],
-          ['Media das ferramentas locais', c.latency.avgLocalMs + ' ms'],
+          ['Execucoes locais / Media', c.latency.localToolCalls + ' calls • ' + c.latency.avgLocalMs + ' ms'],
           ['Baseline p50 / p95', b ? (b.latency.p50LocalMs + ' / ' + b.latency.p95LocalMs + ' ms') : '-'],
+          ['Cache Zero-Stale (Dir / File / KPI hits)', (cs.dirIndexHits || 0) + ' / ' + (cs.fileLruHits || 0) + ' / ' + (cs.kpiCacheHits || 0)],
         ],
       },
     ];
@@ -3340,8 +3395,8 @@ function renderLogsDashboardHtml(): string {
   }
 
   function fetchKpis() {
-    const win = el('kpi-window-select').value || 'v1.4.8';
-    const cmp = el('kpi-compare-select').value || 'v1.4.7';
+    const win = el('kpi-window-select').value || 'v1.4.9';
+    const cmp = el('kpi-compare-select').value || 'v1.4.8';
     state.lastKpiFetchMs = Date.now();
     fetch('/logs/kpis?window=' + encodeURIComponent(win) + '&compare=' + encodeURIComponent(cmp))
       .then((r) => r.ok ? r.json() : null)

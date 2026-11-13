@@ -19,9 +19,9 @@ mcp-dev/
 |-- src/
 |   |-- server.ts         # HTTP, auth do /mcp, sessões e registro das tools
 |   |-- oauth.ts          # provider OAuth 2.1
-|   |-- tools.ts          # catálogo e handlers das 16 ferramentas MCP
-|   |-- audit.ts          # auditoria estruturada, rotação por tamanho e redaction de segredos
-|   |-- monitor.ts        # rastreamento de sessões/transações e painel /logs (SSE)
+|   |-- tools.ts          # catálogo e handlers das 17 ferramentas MCP + caches zero-stale
+|   |-- audit.ts          # auditoria estruturada, versão (MCP_SERVER_VERSION), rotação por tamanho e redaction de segredos
+|   |-- monitor.ts        # rastreamento de sessões/transações, motor de KPIs e painel /logs (SSE)
 |   `-- output-store.ts   # paginação persistida de saídas grandes
 |-- test/
 |   |-- audit.test.mjs

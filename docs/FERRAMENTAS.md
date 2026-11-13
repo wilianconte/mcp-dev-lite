@@ -1,26 +1,27 @@
 # Ferramentas MCP e Guia de Orientação de Uso
 
-A versão `1.4.5` expõe **16 ferramentas**. O catálogo é definido em `src/tools.ts`, registrado dinamicamente pelo servidor em `src/server.ts` e acompanhado por instruções de protocolo (`instructions`) enviadas automaticamente no handshake `initialize`.
+A versão `1.4.9` expõe **17 ferramentas**. O catálogo é definido em `src/tools.ts`, registrado dinamicamente pelo servidor em `src/server.ts` e acompanhado por instruções de protocolo (`instructions`) enviadas automaticamente no handshake `initialize`.
 
 ## Visão geral
 
 | Ferramenta | Categoria | Efeito colateral | Quando usar |
 |---|---|---|---|
-| `find_files` | Descoberta de arquivos (`rg --files`) | Não | Localizar arquivos por nome, substring ou padrão glob (`*.tsx`, `sidebar`, `schema.prisma`) sem ler o conteúdo interno. |
-| `search_code` | Busca nativa (`rg`) | Não | Localizar símbolos, imports, textos ou regex dentro de arquivos sem subir shell. |
-| `read_file` | Leitura | Não | Ler 1 arquivo de texto (por linhas ou por caracteres), com bloqueio de binários. |
-| `read_files` | Leitura em lote | Não | Ler de 2 a 20 arquivos na mesma chamada (economiza round-trips). |
-| `list_directory` | Leitura | Não | Listar entradas de um diretório com paginação e profundidade opcional (`max_depth` 1 a 4). |
+| `stat_path` | Metadados e existência | Não | Verificar existência, tipo (`file`, `directory`, `symlink`, `missing`), tamanho e `mtime` de 1 a 30 caminhos sem risco de erro `ENOENT`. |
+| `find_files` | Descoberta de arquivos/worktrees (`rg --files`) | Não | Localizar arquivos ou diretórios de worktree por nome, substring ou padrão glob (`*.tsx`, `sidebar`, `.sdd/ledger.md`) sem ler o conteúdo interno. |
+| `search_code` | Busca nativa (`rg`) | Não | Localizar símbolos, imports, textos, checkboxes (`[ ]`) ou regex dentro de arquivos sem subir shell. |
+| `read_file` | Leitura (com cache LRU zero-stale) | Não | Ler 1 arquivo de texto (por linhas ou por caracteres), com `allow_missing=true` opcional e bloqueio de binários. |
+| `read_files` | Leitura em lote | Não | Ler de 2 a 20 arquivos (ou múltiplas faixas `offset`/`limit` do mesmo arquivo) na mesma chamada. |
+| `list_directory` | Leitura | Não | Listar entradas de um diretório com paginação, filtro `pattern` e profundidade opcional (`max_depth` 1 a 4). |
 | `read_image` | Leitura multimodal | Não | Inspecionar PNG/JPEG/GIF/WebP como `ImageContent` MCP nativo. |
-| `edit_file` | Filesystem | Sim | Fazer 1 substituição exata em um arquivo existente (com dicas contextuais se falhar). |
-| `multi_edit_file` | Filesystem (atômico) | Sim | Fazer 2+ substituições disjuntas no mesmo arquivo em uma única chamada. |
+| `edit_file` | Filesystem | Sim | Fazer 1 substituição exata em um arquivo existente (com normalização em 5 passos e dicas contextuais se falhar). |
+| `multi_edit_file` | Filesystem (atômico) | Sim | Fazer 2+ substituições no mesmo arquivo em uma única chamada (com desambiguação *batch-aware* e validação multi-bloco). |
 | `write_file` | Filesystem | Sim | Criar arquivo novo ou reescrever o arquivo inteiro. |
 | `move_file` | Filesystem | Sim | Mover ou renomear arquivo/diretório. |
 | `make_directory` | Filesystem | Sim | Criar diretório recursivamente (`mkdir -p`). |
-| `delete_path` | Filesystem | Sim, irreversível | Excluir arquivo ou diretório (`recursive=true` para árvores). |
+| `delete_path` | Filesystem | Sim, irreversível | Excluir arquivo ou diretório (`recursive=true` para árvores não vazias). |
 | `run_command` | Shell síncrono | Sim | Comandos rápidos (< 15-30s) como `git status`, `git diff`, linters rápidos. |
 | `read_command_output` | Leitura de artefato | Não | Paginar saídas grandes (> 30k chars) geradas por `run_command`, `start_command`, `search_code` ou `find_files`. |
-| `start_command` | Shell assíncrono | Sim | Iniciar comandos longos (> 15-30s: builds, suítes E2E/Playwright, deploys, subagentes CLI) sem risco de timeout HTTP/Cloudflare. |
+| `start_command` | Shell assíncrono | Sim | Iniciar comandos longos (> 15-30s: builds, suítes E2E/Playwright, deploys, subagentes CLI) com coalescência automática de comandos idênticos em execução. |
 | `poll_command` | Shell assíncrono | Não (exceto `kill=true`) | Consultar status/stdout incremental (`offset=next_offset`) ou encerrar job iniciado por `start_command`. |
 
 ---
@@ -75,7 +76,7 @@ Comportamento e salvaguardas:
 - **Exclusão automática de diretórios pesados**: exclui por padrão `node_modules`, `.git`, `.next`, `dist`, `build`, `coverage` e `/root/repos/work`, a menos que `path` ou `globs` apontem explicitamente para um deles.
 - **Extração automática de glob em `path`**: se `path` contiver curingas ao final (ex.: `/dir/scripts/crm-p1-*.test.mjs`), separa automaticamente o diretório base existente (`/dir/scripts`) e aplica o sufixo (`crm-p1-*.test.mjs`) como filtro `--glob`, evitando falha por `ENOENT` (também suportado em `find_files` e `list_directory`).
 - **Diagnóstico de `ENOENT`**: se `path` não existir, retorna erro amigável indicando o diretório pai existente mais próximo, sugestões estruturais (`services/`, `packages/`, `apps/`, etc.) e entradas similares ranqueadas.
-- **Fallback automático de regex inválido**: se `fixed_strings` não for informado e `pattern` contiver metacaracteres desbalanceados (ex.: `"Inter("`, `"foo[bar"`), o `rg` retorna erro de sintaxe de regex (`exit_code: 2`) e o servidor **repete automaticamente a busca em modo literal (`--fixed-strings`)**, sinalizando `mode: fixed_strings_fallback (regex invalido tratado como texto literal)`.
+- **Fallback automático de regex inválido e auto-detecção de colchetes literais**: se `fixed_strings` não for informado e `pattern` contiver checkboxes literais (`[ ]`, `[]`) ou metacaracteres desbalanceados (ex.: `"Inter("`, `"foo[bar"`), o servidor usa modo literal (`--fixed-strings`) automaticamente (`fixed_strings_auto` / `fixed_strings_fallback`).
 - **Zero ocorrências sem erro**: quando nada é encontrado (`rg` exit code 1), retorna `exit_code: 0` e `matches: 0`.
 
 **Boas práticas em `search_code`**:
@@ -84,9 +85,20 @@ Comportamento e salvaguardas:
 
 ---
 
+### `stat_path`
+
+Verifica rapidamente a existência e metadados (`exists`, `type`: `file`/`directory`/`symlink`/`missing`, `size_bytes`, `mtime`) de 1 a 30 caminhos em uma única chamada, sem gerar erro `ENOENT`.
+
+Entradas:
+- `paths`: lista de 1 a 30 caminhos absolutos, relativos ou com `~`.
+
+Quando um caminho não existe (`exists: false`), retorna `suggestions` com caminhos irmãos de nome similar (distância de edição Levenshtein ou sobreposição de tokens).
+
+---
+
 ### `find_files`
 
-Busca arquivos pelo nome ou caminho relativo usando `ripgrep --files` (muito mais rápido que `find` e já ignorando `node_modules`, `.git`, `.next`, `dist`, `build`, `coverage` e `/root/repos/work` por padrão).
+Busca arquivos ou diretórios de worktree pelo nome ou caminho relativo usando `ripgrep --files` (muito mais rápido que `find` e já ignorando `node_modules`, `.git`, `.next`, `dist`, `build`, `coverage` e `/root/repos/work` por padrão).
 
 Entradas:
 
@@ -100,9 +112,9 @@ Entradas:
 
 Comportamento:
 
-- Lista caminhos relativos a `path` em ordem alfabética;
-- Informa `matched_files`, `returned_files`, `has_more` e os caminhos encontrados;
-- Se `path` não existir, retorna erro com dica listando o diretório pai existente mais próximo.
+- Usa o índice de diretórios *zero-stale* (`WorktreeDirectoryIndexCache`) para listar diretórios de topo correspondentes (`matching_directories`) e podar subdiretórios em `/root/repos/work` quando o `pattern` filtra worktrees específicas;
+- Faz fallback automático com `--no-ignore-vcs` (mantendo exclusão de diretórios pesados) quando `returned_files === 0` ou quando o padrão busca `.sdd`, `.superpowers` ou `ledger.md`;
+- Lista caminhos em ordem alfabética, informando `matching_directories`, `returned_files`, `total_files` e `truncated`.
 
 ---
 
@@ -323,5 +335,5 @@ O painel em tempo real em `/logs` possui 4 abas:
 3. **Alertas**: watchdog configurável de inatividade com alerta sonoro via Web Audio API e histórico de incidentes.
 4. **KPI's (`#kpis` / `GET /logs/kpis`)**:
    - **Termômetro de Massa Crítica**: acompanha os 4 pilares para reavaliação estatística (`>= 1.500` chamadas totais, `>= 200` edições `edit_file` + `multi_edit_file`, `>= 80` chamadas `poll_command`, ou critério híbrido de `7 dias` com mínimo de `1.000` chamadas), classificando em `COLETA_INICIAL`, `PRELIMINAR` (`>= 500` calls, `>= 75` edições, `>= 30` polls) ou `PRONTA`.
-   - **6 Scorecards Qualitativos com comparativo de baseline (`v1.4.5` vs `v1.4.4`)**: Confiabilidade Global (`>= 99%`), Qualidade de Edição e Auto-Recuperação sem `read_file` (*Self-Heal*), Eficiência de Jobs e Polling (`wait_ms >= 60s`), Higiene de Ambiente e Ferramentas Nativas (`NVM manual = 0`), Economia de Contexto e Batching, e Latência Nativa Local (`p50`/`p95`).
+   - **6 Scorecards Qualitativos com comparativo de baseline (`v1.4.9` vs `v1.4.8`)**: Confiabilidade Global (`>= 99%`), Qualidade de Edição e Auto-Recuperação sem `read_file` (*Self-Heal*), Eficiência de Jobs e Polling (`wait_ms >= 60s`), Higiene de Ambiente e Ferramentas Nativas (`NVM manual = 0`), Economia de Contexto e Batching, e Latência Nativa Local (`p50`/`p95` + telemetria de hits dos Caches Zero-Stale).
    - **Tabela por Ferramenta e Diagnóstico de Erros/Anti-Padrões**: detalha volume, taxas de erro, latências `p50/p95`, payload médio e assinaturas residuais.

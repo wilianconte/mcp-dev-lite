@@ -78,18 +78,21 @@ Estado somente em memória:
 
 ### `src/tools.ts`
 
-Define o catálogo de 16 ferramentas e seus schemas Zod. Os handlers retornam `CallToolResult`, permitindo resultados textuais e multimodais.
+Define o catálogo de 17 ferramentas, seus schemas Zod e os módulos internos de cache *zero-stale* e governança de jobs. Os handlers retornam `CallToolResult`, permitindo resultados textuais e multimodais.
 
 Os grupos principais são:
 
-- execução de shell síncrono (`run_command`, `read_command_output`) e assíncrono em background (`start_command`, `poll_command`);
-- busca nativa de código e de arquivos via `ripgrep` (`search_code`, `find_files`);
-- leitura e escrita de filesystem unitária e em lote (`read_file`, `read_files`, `write_file`, `edit_file`, `multi_edit_file`, `list_directory`, `move_file`, `make_directory`, `delete_path`);
-- leitura de screenshots como `ImageContent` MCP (`read_image`).
+- execução de shell síncrono (`run_command`, `read_command_output`) e assíncrono em background (`start_command`, `poll_command`), com coalescência (re-attach) de jobs idênticos em execução e limpeza automática de watchers órfãos (`gh run watch` / `gh pr checks --watch`);
+- busca nativa de código e de arquivos via `ripgrep` (`search_code`, `find_files`), com poda de worktrees, fallback `--no-ignore-vcs` e auto-detecção de colchetes literais;
+- verificação de existência/metadados (`stat_path`) e leitura/escrita de filesystem unitária e em lote (`read_file`, `read_files`, `write_file`, `edit_file`, `multi_edit_file`, `list_directory`, `move_file`, `make_directory`, `delete_path`);
+- leitura de screenshots como `ImageContent` MCP (`read_image`);
+- **Caches Internos Zero-Stale (`v1.4.9`)**:
+  1. `WorktreeDirectoryIndexCache`: cache em memória das listagens de diretórios pai (como `/root/repos/work`), validado a cada acesso via `statSync(dirPath).mtimeMs` (`~0.04ms`), eliminando varreduras repetidas de `readdirSync` e `sort` sem qualquer risco de dado defasado;
+  2. `FileContentPaginationLruCache`: cache LRU (máx. 16 arquivos / 512 KiB) de arquivos recém-lidos com líneas pré-indexadas para paginação `offset`/`limit`, validado contra `(stat.mtimeMs, stat.size)` em cada leitura e invalidado explicitamente em `write_file`, `edit_file`, `multi_edit_file`, `move_file` e `delete_path`.
 
 ### `src/monitor.ts`
 
-Mantém o rastreamento em tempo real das sessões MCP e das transações (`tools/call`), hidratando o histórico inicial a partir da cauda (últimos 2 MiB) do arquivo JSONL de auditoria (`data/audit.jsonl`) e transmitindo atualizações ao vivo via Server-Sent Events (`/logs/stream`) para o painel web em `/logs`. Handshakes efêmeros (`mcp.initialize`, `mcp.sse_open`, `mcp.tools_list`) atualizam as métricas de sessão sem poluir o buffer de 500 transações (a menos que `MCP_LOG_PROTOCOL_EVENTS=true`).
+Mantém o rastreamento em tempo real das sessões MCP, transações (`tools/call`), alertas de inatividade e motor de KPI's qualitativos (`/logs/kpis`), hidratando o histórico inicial a partir da cauda (últimos 25 MiB, incluindo `audit.jsonl.1` rotacionado) do arquivo JSONL de auditoria (`data/audit.jsonl`) e transmitindo atualizações ao vivo via Server-Sent Events (`/logs/stream`) para o painel web em `/logs`. Inclui o `KpiWindowComputationCache`, que memoriza as métricas computadas por janela (`v1.4.3`..`v1.4.9`) indexadas pelo contador monotônico `kpiMutationSeq`.
 
 ### `src/output-store.ts`
 

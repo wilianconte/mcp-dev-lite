@@ -32,6 +32,6 @@ Quando uma mudança de código alterar comportamento, atualize o documento propr
 
 ## Estado atual resumido
 
-A versão atual é `1.4.9` e expõe 17 ferramentas. O projeto usa Node.js 20+, TypeScript em modo estrito, Express, o SDK oficial do Model Context Protocol e transporte Streamable HTTP.
+A versão atual é `1.5.0` e expõe 17 ferramentas. O projeto usa Node.js 20+, TypeScript em modo estrito, Express, o SDK oficial do Model Context Protocol e transporte Streamable HTTP.
 
 O servidor aceita autenticação por token estático e OAuth 2.1, mantém sessões MCP em memória e permite execução arbitrária de shell e acesso irrestrito ao filesystem do usuário do processo. Essa autonomia é intencional e deve ser tratada como uma fronteira de segurança crítica.

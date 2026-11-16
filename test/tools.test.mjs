@@ -1123,3 +1123,151 @@ test('v1.4.9: cache zero-stale (FileLRU + WorktreeDirIndex), desambiguacao batch
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test('v1.5.0: Passo 6a/6b/6c de normalizacao Markdown (sub-frase "- ", marcador de lista e backticks/bold inline), ranking top-3 em ENOENT, fallback de job recem-concluido em poll_command e auto-promocao de agy --print em run_command', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'mcp-dev-test-v150-'));
+  try {
+    // 1. Passo 6a: sub-frase dentro de item de lista Markdown onde old_string/new_string receberam prefixo "- " espurio
+    const specFile = path.join(root, 'SPEC.md');
+    await writeFile(
+      specFile,
+      [
+        '# Especificacao',
+        '- Ordenação determinística por ID. `groupsHash` e `matrixHash` são calculados com SHA-256 sobre arrays ordenados (determinismo em testes de paridade).',
+      ].join('\n'),
+      'utf8',
+    );
+    await tool('edit_file').handler({
+      path: specFile,
+      old_string:
+        '- `groupsHash` e `matrixHash` são calculados com SHA-256 sobre arrays ordenados (determinismo em testes de paridade).',
+      new_string:
+        '- `groupsHash` e `matrixHash` são calculados com SHA-256 canônico (chaves recursivamente ordenadas + arrays ordenados por ID).',
+    });
+    const specAfter = await readFile(specFile, 'utf8');
+    assert.match(
+      specAfter,
+      /- Ordenação determinística por ID\. `groupsHash` e `matrixHash` são calculados com SHA-256 canônico \(chaves recursivamente ordenadas \+ arrays ordenados por ID\)\./,
+    );
+
+    // 2. Passo 6b: divergencia no marcador de lista Markdown ("2. " vs "3. " com ajuste de lista numerada e "- " vs "3. ")
+    const rulesFile = path.join(root, 'RULES.md');
+    await writeFile(
+      rulesFile,
+      [
+        '1. **AUTH-016:** Token expirado deve retornar 401.',
+        '2. **AUTH-017:** Escopo insuficiente deve retornar 403.',
+        '3. **AUTH-018:** OWNER/ADMIN não autenticados ou sem MFA em rotas sensíveis devem falhar com erro explícito.',
+      ].join('\n'),
+      'utf8',
+    );
+    await tool('edit_file').handler({
+      path: rulesFile,
+      old_string:
+        '2. **AUTH-018:** OWNER/ADMIN não autenticados ou sem MFA em rotas sensíveis devem falhar com erro explícito.',
+      new_string: [
+        '2. **AUTH-018:** OWNER/ADMIN não autenticados ou sem MFA em rotas sensíveis devem falhar com erro explícito.',
+        '3. **AUTH-019:** Mudanças de papel exigem trilha de auditoria imutável.',
+      ].join('\n'),
+    });
+    const rulesAfter = await readFile(rulesFile, 'utf8');
+    assert.match(rulesAfter, /3\. \*\*AUTH-018:\*\* OWNER\/ADMIN/);
+    assert.match(rulesAfter, /4\. \*\*AUTH-019:\*\* Mudanças de papel/);
+
+    // 3. Passo 6c: tolerancia a marcadores inline Markdown (`code` e **bold**) presentes no arquivo ou em old_string
+    const readmeFile = path.join(root, 'README_MOD.md');
+    await writeFile(
+      readmeFile,
+      [
+        '- Source-of-truth e precedência: [`modules/README.md`](./modules/README.md)',
+        '- Testes de contrato cobrindo parseConfig, precedência e validação estrita.',
+      ].join('\n'),
+      'utf8',
+    );
+    await tool('multi_edit_file').handler({
+      path: readmeFile,
+      edits: [
+        {
+          old_string: '- Source-of-truth e precedência: [modules/README.md](./modules/README.md)',
+          new_string: '- Source-of-truth e precedência: [`modules/README.md`](./modules/README.md) (canônico)',
+        },
+        {
+          old_string: '- Testes de contrato cobrindo `parseConfig`, precedência e validação estrita.',
+          new_string: '- Testes de contrato cobrindo `parseConfig`, precedência, fallback e validação estrita.',
+        },
+      ],
+    });
+    const readmeAfter = await readFile(readmeFile, 'utf8');
+    assert.match(readmeAfter, /\(canônico\)/);
+    assert.match(readmeAfter, /precedência, fallback e validação estrita/);
+
+    // 4. inspectMissingPathDetails: ranking top-3 apos ordenacao por score (priorizando plan-authz-wp009 sobre plan-admin-*)
+    const workParent = path.join(root, 'worktrees');
+    for (const dirName of [
+      'plan-admin-wp002-20261115',
+      'plan-admin-wp003-20261115',
+      'plan-admin-wp005-20261115',
+      'plan-authz-wp009-20261116',
+    ]) {
+      const subDir = path.join(workParent, dirName, 'plans', 'authz');
+      await mkdir(subDir, { recursive: true });
+      await writeFile(path.join(subDir, 'EXECUTION.yaml'), `id: ${dirName}\n`, 'utf8');
+    }
+    await assert.rejects(
+      () =>
+        tool('read_file').handler({
+          path: path.join(workParent, 'plan-authz-wp009', 'plans', 'authz', 'EXECUTION.yaml'),
+        }),
+      /Sugestao encontrada: [^\n]*plan-authz-wp009-20261116\/plans\/authz\/EXECUTION\.yaml/,
+    );
+
+    // 5. poll_command: fallback automatico para job recem-concluido ainda nao consultado quando job_id e alucinado
+    const fastStart = await tool('start_command').handler({
+      command: 'sleep 0.15 && printf "job_concluido_nao_polled\\n"',
+      cwd: root,
+      wait_ms: 10,
+    });
+    const fastJobId = textOf(fastStart).match(/job_id: ([0-9a-f-]{36})/)?.[1];
+    assert.ok(fastJobId);
+    await new Promise((r) => setTimeout(r, 300));
+
+    const wrongId = '7b5a1e92-1111-4222-8333-999999999999';
+    const pollCompleted = await tool('poll_command').handler({
+      job_id: wrongId,
+      wait_ms: 50,
+    });
+    const pollCompletedText = textOf(pollCompleted);
+    assert.match(pollCompletedText, new RegExp(`job_id: ${fastJobId}`));
+    assert.match(pollCompletedText, new RegExp(`job_id_autocorrected_from: ${wrongId}`));
+    assert.match(pollCompletedText, /job_concluido_nao_polled/);
+
+    // 6. run_command: auto-promocao de comando "agy ... --print" lento para background job sem matar o processo
+    const fakeBinDir = path.join(root, 'bin');
+    await mkdir(fakeBinDir, { recursive: true });
+    const fakeAgy = path.join(fakeBinDir, 'agy');
+    await writeFile(
+      fakeAgy,
+      '#!/usr/bin/env bash\nprintf "agy_iniciado\\n"\nsleep 10\nprintf "agy_finalizado\\n"\n',
+      { encoding: 'utf8', mode: 0o755 },
+    );
+    const prevPath = process.env.PATH;
+    process.env.PATH = `${fakeBinDir}:${prevPath}`;
+    try {
+      const agyRes = await tool('run_command').handler({
+        command: 'agy --dangerously-skip-permissions --print "tarefa longa"',
+        cwd: root,
+        timeout_ms: 250,
+      });
+      const agyText = textOf(agyRes);
+      assert.match(agyText, /auto_promoted_to_background_job: true/);
+      assert.match(agyText, /status: running/);
+      const promotedJobId = agyText.match(/job_id: ([0-9a-f-]{36})/)?.[1];
+      assert.ok(promotedJobId);
+      await tool('poll_command').handler({ job_id: promotedJobId, kill: true });
+    } finally {
+      process.env.PATH = prevPath;
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

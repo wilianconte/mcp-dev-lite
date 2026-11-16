@@ -262,10 +262,10 @@ test('servidor integra auth, sessoes MCP, auditoria, proxy e OAuth PKCE', { time
     assert.match(logsHtml, /id="tab-panel-kpis"/);
     assert.match(logsHtml, /mcp_monitor_alert_cfg_v1/);
 
-    const kpisRes = await fetch(`${baseUrl}/logs/kpis?window=v1.4.9&compare=v1.4.8`);
+    const kpisRes = await fetch(`${baseUrl}/logs/kpis?window=v1.5.0&compare=v1.4.9`);
     assert.equal(kpisRes.status, 200);
     const kpiReport = await kpisRes.json();
-    assert.equal(kpiReport.currentVersion, '1.4.9');
+    assert.equal(kpiReport.currentVersion, '1.5.0');
     assert.ok(kpiReport.current.reliability.totalCalls >= 1);
     assert.ok(kpiReport.cacheStats, 'kpiReport deve incluir estatisticas de cache zero-stale');
     assert.equal(kpiReport.current.sampleReadiness.calls.target, 1500);

@@ -47,13 +47,13 @@ mcp-dev-agent  (Express + Streamable HTTP, porta 3000)
 | `search_code` | Busca código com `ripgrep` (`rg`) nativo sem subir bash, ignorando `node_modules`/`.git`/`.next`/`dist` por padrão, com auto-detecção de colchetes literais (`[ ]`) e fallback automático para texto literal se o regex for inválido. |
 | `read_file` | Lê texto por linhas ou por caracteres (com cache LRU zero-stale validado por `mtimeMs + size` e opção `allow_missing=true`), bloqueio automático de arquivos binários e limite de tamanho (`MCP_MAX_TEXT_FILE_BYTES`). |
 | `read_files` | Lê de 1 a 20 arquivos de texto (ou múltiplas faixas `offset`/`limit` do mesmo arquivo) em paralelo numa única chamada, reduzindo round-trips. |
-| `edit_file` | Substituição de texto exato (`old_string` → `new_string`, com `replace_all`), normalização inteligente de espaços/indentação/escapes Bash e diagnóstico contextual de linhas em caso de falha. |
-| `multi_edit_file` | Aplica múltiplas substituições exatas no mesmo arquivo de forma atômica (com desambiguação *batch-aware* de ocorrências e validação de todos os blocos de uma vez). |
+| `edit_file` | Substituição de texto exato (`old_string` → `new_string`, com `replace_all`), normalização inteligente em 6 estágios (espaços, indentação, escapes Bash, marcadores de lista e formatação inline Markdown) e diagnóstico contextual de linhas em caso de falha. |
+| `multi_edit_file` | Aplica múltiplas substituições exatas no mesmo arquivo de forma atômica (com desambiguação *batch-aware* de ocorrências, normalização em 6 estágios e validação de todos os blocos de uma vez). |
 | `write_file` | Cria ou sobrescreve um arquivo (cria diretórios pais e invalida imediatamente o cache de leitura). |
-| `run_command` | Executa shell síncrono (bash) com `cwd`/`timeout` para comandos rápidos (< 15-30s). Saídas grandes recebem prévia início + fim e `artifact_id`. |
+| `run_command` | Executa shell síncrono (bash) com `cwd`/`timeout` para comandos rápidos (< 15-30s) e auto-promoção para background job quando invocado com subagentes CLI longos (`agy --print`). Saídas grandes recebem prévia início + fim e `artifact_id`. |
 | `read_command_output` | Lê, por `offset`/`limit`, qualquer trecho de uma saída grande preservada por `run_command`, `start_command`, `search_code` ou `find_files`. |
 | `start_command` | Inicia comando longo em background (builds, testes E2E/Playwright, deploys, subagentes CLI) com coalescência (re-attach) automática de processos idênticos em execução e limpeza de watchers órfãos. |
-| `poll_command` | Consulta status, lê novas saídas incrementais (`offset=next_offset`), corrige typos de `job_id` / faz fallback para job único ativo ou encerra (`kill=true`) um job iniciado por `start_command`. |
+| `poll_command` | Consulta status, lê novas saídas incrementais (`offset=next_offset`), corrige typos de `job_id`, faz fallback para job único ativo ou recém-concluído ainda não consultado e encerra (`kill=true`) um job iniciado por `start_command`. |
 | `read_image` | Lê PNG/JPEG/GIF/WebP e retorna **ImageContent MCP nativo** + path, MIME, bytes, dimensões quando detectáveis e SHA-256. |
 | `list_directory` | Lista entradas com paginação (`offset`, `limit`, `has_more`, `next_offset`), filtro `pattern` e profundidade recursiva opcional (`max_depth` de 1 a 4). |
 | `move_file` | Move ou renomeia arquivo/diretório. |

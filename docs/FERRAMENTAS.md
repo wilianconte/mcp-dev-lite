@@ -1,6 +1,6 @@
 # Ferramentas MCP e Guia de Orientação de Uso
 
-A versão `1.4.9` expõe **17 ferramentas**. O catálogo é definido em `src/tools.ts`, registrado dinamicamente pelo servidor em `src/server.ts` e acompanhado por instruções de protocolo (`instructions`) enviadas automaticamente no handshake `initialize`.
+A versão `1.5.0` expõe **17 ferramentas**. O catálogo é definido em `src/tools.ts`, registrado dinamicamente pelo servidor em `src/server.ts` e acompanhado por instruções de protocolo (`instructions`) enviadas automaticamente no handshake `initialize`.
 
 ## Visão geral
 
@@ -13,16 +13,16 @@ A versão `1.4.9` expõe **17 ferramentas**. O catálogo é definido em `src/too
 | `read_files` | Leitura em lote | Não | Ler de 2 a 20 arquivos (ou múltiplas faixas `offset`/`limit` do mesmo arquivo) na mesma chamada. |
 | `list_directory` | Leitura | Não | Listar entradas de um diretório com paginação, filtro `pattern` e profundidade opcional (`max_depth` 1 a 4). |
 | `read_image` | Leitura multimodal | Não | Inspecionar PNG/JPEG/GIF/WebP como `ImageContent` MCP nativo. |
-| `edit_file` | Filesystem | Sim | Fazer 1 substituição exata em um arquivo existente (com normalização em 5 passos e dicas contextuais se falhar). |
-| `multi_edit_file` | Filesystem (atômico) | Sim | Fazer 2+ substituições no mesmo arquivo em uma única chamada (com desambiguação *batch-aware* e validação multi-bloco). |
+| `edit_file` | Filesystem | Sim | Fazer 1 substituição exata em um arquivo existente (com normalização em 6 estágios e dicas contextuais se falhar). |
+| `multi_edit_file` | Filesystem (atômico) | Sim | Fazer 2+ substituições no mesmo arquivo em uma única chamada (com desambiguação *batch-aware*, normalização em 6 estágios e validação multi-bloco). |
 | `write_file` | Filesystem | Sim | Criar arquivo novo ou reescrever o arquivo inteiro. |
 | `move_file` | Filesystem | Sim | Mover ou renomear arquivo/diretório. |
 | `make_directory` | Filesystem | Sim | Criar diretório recursivamente (`mkdir -p`). |
 | `delete_path` | Filesystem | Sim, irreversível | Excluir arquivo ou diretório (`recursive=true` para árvores não vazias). |
-| `run_command` | Shell síncrono | Sim | Comandos rápidos (< 15-30s) como `git status`, `git diff`, linters rápidos. |
+| `run_command` | Shell síncrono | Sim | Comandos rápidos (< 15-30s) como `git status`, `git diff`, linters rápidos (com auto-promoção para background job em `agy --print` longos). |
 | `read_command_output` | Leitura de artefato | Não | Paginar saídas grandes (> 30k chars) geradas por `run_command`, `start_command`, `search_code` ou `find_files`. |
 | `start_command` | Shell assíncrono | Sim | Iniciar comandos longos (> 15-30s: builds, suítes E2E/Playwright, deploys, subagentes CLI) com coalescência automática de comandos idênticos em execução. |
-| `poll_command` | Shell assíncrono | Não (exceto `kill=true`) | Consultar status/stdout incremental (`offset=next_offset`) ou encerrar job iniciado por `start_command`. |
+| `poll_command` | Shell assíncrono | Não (exceto `kill=true`) | Consultar status/stdout incremental (`offset=next_offset`), com fallback para job único ativo ou recém-concluído não consultado, ou encerrar job iniciado por `start_command`. |
 
 ---
 
@@ -335,5 +335,5 @@ O painel em tempo real em `/logs` possui 4 abas:
 3. **Alertas**: watchdog configurável de inatividade com alerta sonoro via Web Audio API e histórico de incidentes.
 4. **KPI's (`#kpis` / `GET /logs/kpis`)**:
    - **Termômetro de Massa Crítica**: acompanha os 4 pilares para reavaliação estatística (`>= 1.500` chamadas totais, `>= 200` edições `edit_file` + `multi_edit_file`, `>= 80` chamadas `poll_command`, ou critério híbrido de `7 dias` com mínimo de `1.000` chamadas), classificando em `COLETA_INICIAL`, `PRELIMINAR` (`>= 500` calls, `>= 75` edições, `>= 30` polls) ou `PRONTA`.
-   - **6 Scorecards Qualitativos com comparativo de baseline (`v1.4.9` vs `v1.4.8`)**: Confiabilidade Global (`>= 99%`), Qualidade de Edição e Auto-Recuperação sem `read_file` (*Self-Heal*), Eficiência de Jobs e Polling (`wait_ms >= 60s`), Higiene de Ambiente e Ferramentas Nativas (`NVM manual = 0`), Economia de Contexto e Batching, e Latência Nativa Local (`p50`/`p95` + telemetria de hits dos Caches Zero-Stale).
+   - **6 Scorecards Qualitativos com comparativo de baseline (`v1.5.0` vs `v1.4.9`)**: Confiabilidade Global (`>= 99%`), Qualidade de Edição e Auto-Recuperação sem `read_file` (*Self-Heal*), Eficiência de Jobs e Polling (`wait_ms >= 60s`), Higiene de Ambiente e Ferramentas Nativas (`NVM manual = 0`), Economia de Contexto e Batching, e Latência Nativa Local (`p50`/`p95` + telemetria de hits dos Caches Zero-Stale).
    - **Tabela por Ferramenta e Diagnóstico de Erros/Anti-Padrões**: detalha volume, taxas de erro, latências `p50/p95`, payload médio e assinaturas residuais.

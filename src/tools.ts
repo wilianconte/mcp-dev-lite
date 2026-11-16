@@ -162,6 +162,7 @@ let fileCacheMisses = 0;
 let fileCacheBytesSaved = 0;
 let reattachedBackgroundJobs = 0;
 let autoReapedWatchers = 0;
+let autoPromotedCommands = 0;
 
 function invalidateFileCache(targetPath?: string): void {
   if (!targetPath) {
@@ -181,6 +182,7 @@ export interface InternalCacheAndControlStats {
   fileLruEntries: number;
   reattachedBackgroundJobs: number;
   autoReapedWatchers: number;
+  autoPromotedCommands: number;
 }
 
 export function getInternalCacheStats(): InternalCacheAndControlStats {
@@ -194,6 +196,7 @@ export function getInternalCacheStats(): InternalCacheAndControlStats {
     fileLruEntries: filePaginationCache.size,
     reattachedBackgroundJobs,
     autoReapedWatchers,
+    autoPromotedCommands,
   };
 }
 
@@ -424,6 +427,7 @@ interface BackgroundJob {
   timedOut: boolean;
   maxBufferExceeded: boolean;
   killedByUser: boolean;
+  polledByClient?: boolean;
   recoveredFromDisk?: boolean;
   streamJsonResultNotified?: boolean;
   errorMessage?: string;
@@ -448,6 +452,7 @@ interface PersistedJobSnapshot {
   timedOut: boolean;
   maxBufferExceeded: boolean;
   killedByUser: boolean;
+  polledByClient?: boolean;
   errorMessage?: string;
 }
 
@@ -477,6 +482,7 @@ async function persistJobSnapshot(job: BackgroundJob): Promise<void> {
       timedOut: job.timedOut,
       maxBufferExceeded: job.maxBufferExceeded,
       killedByUser: job.killedByUser,
+      polledByClient: job.polledByClient,
       errorMessage: job.errorMessage,
     };
     const filePath = jobSnapshotPath(job.id);
@@ -511,6 +517,7 @@ async function loadPersistedJob(id: string): Promise<BackgroundJob | undefined> 
       timedOut: Boolean(snap.timedOut),
       maxBufferExceeded: Boolean(snap.maxBufferExceeded),
       killedByUser: Boolean(snap.killedByUser),
+      polledByClient: Boolean(snap.polledByClient),
       recoveredFromDisk: true,
       errorMessage: snap.errorMessage,
       waiters: new Set(),
@@ -814,7 +821,6 @@ function waitForJob(job: BackgroundJob, waitMs: number): Promise<void> {
       cleanup();
       resolve();
     }, waitMs);
-    timer.unref();
     if (job.recoveredFromDisk) {
       livenessInterval = setInterval(() => {
         if (!isProcessAlive(job.pid)) {
@@ -935,22 +941,47 @@ async function resolveJobWithTypoTolerance(
     }
   }
 
-  // Fallback v1.4.8: em operacoes somente-leitura (kill=false), se o job_id foi omitido ou alucinado pelo agente
-  // e existe exatamente 1 job em execucao ativa (running), resolve automaticamente para esse job.
+  // Fallback v1.4.8 / v1.5.0: em operacoes somente-leitura (kill=false), se o job_id foi omitido ou alucinado pelo agente:
+  // (1) se existe exatamente 1 job em execucao ativa (running), resolve automaticamente para esse job;
+  // (2) se nao ha jobs running, mas existe 1 job recem-concluido (<10 min) ainda nao consultado via poll_command, resolve para ele.
   if (allowSingleRunningFallback) {
     const runningJobs = Array.from(backgroundJobs.values()).filter(
       (j) => j.status === "running" && isProcessAlive(j.pid),
     );
     const inMemoryRunning = runningJobs.filter((j) => !j.recoveredFromDisk);
-    const singleCandidate =
-      runningJobs.length === 1
-        ? runningJobs[0]
-        : inMemoryRunning.length === 1
-          ? inMemoryRunning[0]
-          : undefined;
-    if (singleCandidate) {
+    if (inMemoryRunning.length === 1) {
       return {
-        job: singleCandidate,
+        job: inMemoryRunning[0],
+        autoCorrectedFrom: cleanId || undefined,
+        activeJobsHint: "",
+      };
+    }
+
+    if (inMemoryRunning.length === 0) {
+      const now = Date.now();
+      const recentUnpolled = Array.from(backgroundJobs.values())
+        .filter(
+          (j) =>
+            j.status === "completed" &&
+            !j.killedByUser &&
+            !j.polledByClient &&
+            !j.recoveredFromDisk &&
+            j.finishedAtMs !== undefined &&
+            now - j.finishedAtMs <= 10 * 60_000,
+        )
+        .sort((a, b) => (b.finishedAtMs ?? 0) - (a.finishedAtMs ?? 0));
+      if (recentUnpolled.length === 1) {
+        return {
+          job: recentUnpolled[0],
+          autoCorrectedFrom: cleanId || undefined,
+          activeJobsHint: "",
+        };
+      }
+    }
+
+    if (runningJobs.length === 1) {
+      return {
+        job: runningJobs[0],
         autoCorrectedFrom: cleanId || undefined,
         activeJobsHint: "",
       };
@@ -982,6 +1013,7 @@ async function formatJobResult(
   explicitStderrOffset?: number,
   autoCorrectedFrom?: string,
   reattachedToRunningJob = false,
+  autoPromotedFromRunCommand = false,
 ): Promise<CallToolResult> {
   job.lastPolledAtMs = Date.now();
   const fullStdout = Buffer.concat(job.stdoutChunks).toString("utf8");
@@ -1046,6 +1078,9 @@ async function formatJobResult(
     autoCorrectedFrom ? `job_id_autocorrected_from: ${autoCorrectedFrom}` : "",
     reattachedToRunningJob
       ? "reattached_to_running_job: true (reutilizado job identico ja em execucao em vez de criar processo duplicado)"
+      : "",
+    autoPromotedFromRunCommand
+      ? `auto_promoted_to_background_job: true (subagente CLI excedeu a espera sincrona inicial; mantido vivo em background — use poll_command com job_id="${job.id}" para aguardar a conclusao sem perder o trabalho)`
       : "",
     `status: ${job.status}`,
     job.exitCode !== null
@@ -1485,6 +1520,141 @@ function findNormalizedUniqueMatch(
       }
     }
   }
+  // Passo 6a (v1.5.0): sub-frase no meio de um item de lista Markdown onde o agente prefixou old_string/new_string com "- ".
+  if (!oldStr.includes("\n") && oldStr.length >= 25 && /^[ \t]*[-*+][ \t]+\S/.test(oldStr)) {
+    const strippedOld = oldStr.replace(/^[ \t]*[-*+][ \t]+/, "");
+    if (strippedOld.length >= 20) {
+      const occ = countOccurrences(content, strippedOld);
+      if (occ.count === 1) {
+        const lineStart = content.lastIndexOf("\n", occ.firstIndex - 1) + 1;
+        const linePrefix = content.slice(lineStart, occ.firstIndex);
+        if (linePrefix.trim().length > 0 && /^[ \t]*(?:[-*+]|\d+\.)[ \t]+/.test(linePrefix)) {
+          const adjustedNewStr =
+            newStr !== undefined && !newStr.includes("\n") && /^[ \t]*[-*+][ \t]+\S/.test(newStr)
+              ? newStr.replace(/^[ \t]*[-*+][ \t]+/, "")
+              : newStr;
+          return {
+            index: occ.firstIndex,
+            length: strippedOld.length,
+            adjustedNewStr,
+          };
+        }
+      }
+    }
+  }
+  // Passo 6b (v1.5.0): divergencia apenas no marcador de lista Markdown (ex.: "- " vs "3. " ou "2. " vs "3. ").
+  if (!oldStr.includes("\n") && oldStr.length >= 25 && content.length <= 2_000_000) {
+    const listMatch = oldStr.match(/^([ \t]*)([-*+]|\d+\.)([ \t]+)(.+)$/);
+    if (listMatch && listMatch[4].trim().length >= 20) {
+      const oldPrefix = `${listMatch[1]}${listMatch[2]}${listMatch[3]}`;
+      const bodyEscaped = listMatch[4].replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const re = new RegExp(`(?:^|\\n)([ \\t]*(?:[-*+]|\\d+\\.)[ \\t]+)(${bodyEscaped})(?=\\r?\\n|$)`, "g");
+      const first = re.exec(content);
+      if (first && !re.exec(content)) {
+        const leadingNewlineOffset = first[0].startsWith("\n") ? 1 : 0;
+        const matchIndex = first.index + leadingNewlineOffset;
+        const matchLength = first[0].length - leadingNewlineOffset;
+        const actualPrefix = first[1];
+        let adjustedNewStr = newStr;
+        if (newStr !== undefined) {
+          const oldNum = /^\d+\.$/.test(listMatch[2]) ? Number.parseInt(listMatch[2], 10) : Number.NaN;
+          const actualMarkerMatch = actualPrefix.match(/^([ \t]*)(\d+)\.([ \t]+)$/);
+          const actualNum = actualMarkerMatch ? Number.parseInt(actualMarkerMatch[2], 10) : Number.NaN;
+          if (!Number.isNaN(oldNum) && !Number.isNaN(actualNum) && oldNum !== actualNum && newStr.includes("\n")) {
+            const delta = actualNum - oldNum;
+            const newLines = newStr.split("\n");
+            if (newLines.every((ln) => /^[ \t]*\d+\.[ \t]+/.test(ln))) {
+              adjustedNewStr = newLines
+                .map((ln) =>
+                  ln.replace(/^([ \t]*)(\d+)(\.[ \t]+)/, (_, ws, numStr, rest) => `${ws}${Number.parseInt(numStr, 10) + delta}${rest}`),
+                )
+                .join("\n");
+            } else if (newStr.startsWith(oldPrefix)) {
+              adjustedNewStr = `${actualPrefix}${newStr.slice(oldPrefix.length)}`;
+            }
+          } else if (newStr.startsWith(oldPrefix)) {
+            adjustedNewStr = `${actualPrefix}${newStr.slice(oldPrefix.length)}`;
+          }
+        }
+        return {
+          index: matchIndex,
+          length: matchLength,
+          adjustedNewStr,
+        };
+      }
+    }
+  }
+  // Passo 6c (v1.5.0): tolerancia a diferenca apenas em marcadores inline Markdown (`code` ou **bold**).
+  if (oldStr.length >= 25 && content.length <= 2_000_000) {
+    const strippedOld = oldStr.replace(/`|\*\*/g, "");
+    if (strippedOld.trim().length >= 20) {
+      const strippedContent = content.replace(/`|\*\*/g, "");
+      const strippedOcc = countOccurrences(strippedContent, strippedOld);
+      if (strippedOcc.count === 1) {
+        const targetStart = strippedOcc.firstIndex;
+        const targetEnd = targetStart + strippedOld.length;
+        let sIdx = 0;
+        let origStart = -1;
+        let origEnd = -1;
+        let i = 0;
+        while (i < content.length) {
+          if (content[i] === "`") {
+            i += 1;
+            continue;
+          }
+          if (content[i] === "*" && content[i + 1] === "*") {
+            i += 2;
+            continue;
+          }
+          if (sIdx === targetStart && origStart === -1) {
+            origStart = i;
+          }
+          sIdx += 1;
+          i += 1;
+          if (sIdx === targetEnd) {
+            origEnd = i;
+            break;
+          }
+        }
+        if (origStart !== -1 && origEnd !== -1) {
+          const countBackticks = (s: string) => (s.match(/`/g) ?? []).length;
+          const countBold = (s: string) => (s.match(/\*\*/g) ?? []).length;
+          if (
+            origStart >= 1 &&
+            content[origStart - 1] === "`" &&
+            (oldStr.startsWith("`") || countBackticks(content.slice(origStart, origEnd)) % 2 === 1)
+          ) {
+            origStart -= 1;
+          }
+          if (
+            origEnd < content.length &&
+            content[origEnd] === "`" &&
+            (oldStr.endsWith("`") || countBackticks(content.slice(origStart, origEnd)) % 2 === 1)
+          ) {
+            origEnd += 1;
+          }
+          if (
+            origStart >= 2 &&
+            content.slice(origStart - 2, origStart) === "**" &&
+            (oldStr.startsWith("**") || countBold(content.slice(origStart, origEnd)) % 2 === 1)
+          ) {
+            origStart -= 2;
+          }
+          if (
+            origEnd + 1 < content.length &&
+            content.slice(origEnd, origEnd + 2) === "**" &&
+            (oldStr.endsWith("**") || countBold(content.slice(origStart, origEnd)) % 2 === 1)
+          ) {
+            origEnd += 2;
+          }
+          return {
+            index: origStart,
+            length: origEnd - origStart,
+          };
+        }
+      }
+    }
+  }
   return null;
 }
 
@@ -1508,8 +1678,8 @@ function buildMissingOldStringHint(content: string, oldStr: string): string {
   });
 
   const scoreWindowAt = (startLineIdx: number): { score: number; distinctiveHits: number } => {
-    const winStart = Math.max(0, startLineIdx - 2);
-    const winEnd = Math.min(fileLines.length, startLineIdx + Math.min(rawOldLines.length + 3, 10));
+    const winStart = Math.max(0, startLineIdx - 3);
+    const winEnd = Math.min(fileLines.length, startLineIdx + Math.min(rawOldLines.length + 5, 14));
     const winText = fileLines.slice(winStart, winEnd).join("\n").toLowerCase();
     let score = 0;
     let distinctiveHits = 0;
@@ -1531,17 +1701,27 @@ function buildMissingOldStringHint(content: string, oldStr: string): string {
   let step1BestScore = 0;
   let step1FoundUnique = false;
 
+  const isLowEntropyStructural = (s: string): boolean =>
+    /^-\s*kind:\s*\w+$/i.test(s) ||
+    /^(?:blockers|evidence|gates|work_packages|status|owner|id):\s*(?:\[\]|DONE|PENDING|EXECUTING|BLOCKED)?$/i.test(s);
+
   // Passo 1: avalia linhas candidatas de old_string priorizando linhas unicas/raras e maior sobreposicao de janela.
-  const candidates = [...indexedOldLines.slice(0, 12)].sort((a, b) => b.trimmed.length - a.trimmed.length);
+  const candidates = [...indexedOldLines.slice(0, 12)].sort((a, b) => {
+    const aLow = isLowEntropyStructural(a.trimmed) ? 1 : 0;
+    const bLow = isLowEntropyStructural(b.trimmed) ? 1 : 0;
+    if (aLow !== bLow) return aLow - bLow;
+    return b.trimmed.length - a.trimmed.length;
+  });
   for (const candObj of candidates) {
     const cand = candObj.trimmed;
     if (cand.length < 4) continue;
+    if (indexedOldLines.length > 1 && isLowEntropyStructural(cand) && step1BestScore > 0) continue;
     const candLower = cand.toLowerCase();
     const matchingIndices: number[] = [];
     for (let i = 0; i < fileLines.length; i += 1) {
       if (fileLines[i].includes(cand) || fileLines[i].toLowerCase().includes(candLower)) {
         matchingIndices.push(i);
-        if (matchingIndices.length >= 40) break;
+        if (matchingIndices.length >= 250) break;
       }
     }
     if (matchingIndices.length === 0) continue;
@@ -1589,7 +1769,7 @@ function buildMissingOldStringHint(content: string, oldStr: string): string {
   // para que blocos com tokens distintivos (ex.: 'WP-PLAN-005') tenham prioridade.
   if ((matchIdx === -1 || !step1FoundUnique) && tokenSpecs.length >= 1) {
     const bulletPrefix = oldLines[0].match(/^([-*+]|\d+\.|\|)\s+/)?.[0];
-    const windowLines = Math.min(Math.max(1, oldLines.length), 4);
+    const windowLines = Math.min(Math.max(2, oldLines.length + 2), 8);
 
     let bestScore = 0;
     let bestLine = -1;
@@ -1645,8 +1825,8 @@ function buildMissingOldStringHint(content: string, oldStr: string): string {
     return "";
   }
 
-  const start = Math.max(0, matchIdx - 2);
-  const end = Math.min(fileLines.length, matchIdx + Math.min(rawOldLines.length + 4, 12));
+  const start = Math.max(0, matchIdx - 4);
+  const end = Math.min(fileLines.length, matchIdx + Math.min(Math.max(rawOldLines.length + 8, 14), 22));
   const snippet = fileLines
     .slice(start, end)
     .map((line, i) => `  ${start + i + 1} | ${formatSnippetLine(line)}`)
@@ -1844,14 +2024,14 @@ async function inspectMissingPathDetails(target: string): Promise<MissingPathDet
           for (const tk of tokens) {
             if (nameLower.includes(tk)) score += 10;
           }
-          if (!missingRemainder && isTypoMatch && candidates.length < 3) {
-            candidates.push(path.join(parent, e.name));
-          }
-          if (score >= 20 && missingRemainder && e.isDirectory()) {
+          let matchedCandidatePath: string | undefined;
+          if (!missingRemainder && isTypoMatch) {
+            matchedCandidatePath = path.join(parent, e.name);
+          } else if (score >= 20 && missingRemainder && e.isDirectory()) {
             const subCandidate = path.join(parent, e.name, missingRemainder);
             if (existsSync(subCandidate)) {
               score += 80;
-              if (candidates.length < 3) candidates.push(subCandidate);
+              matchedCandidatePath = subCandidate;
             } else if (isTypoMatch && !missingRemainder.includes(path.sep)) {
               try {
                 const subDirents = readdirSync(path.join(parent, e.name));
@@ -1859,14 +2039,14 @@ async function inspectMissingPathDetails(target: string): Promise<MissingPathDet
                 const closeSub = subDirents.find((sn) => isCloseTypoOrWorktreeMatch(sn.toLowerCase(), remLower));
                 if (closeSub) {
                   score += 80;
-                  if (candidates.length < 3) candidates.push(path.join(parent, e.name, closeSub));
+                  matchedCandidatePath = path.join(parent, e.name, closeSub);
                 }
               } catch {
                 // Ignora erro de leitura no subdiretorio candidato.
               }
             }
           }
-          return { dirent: e, score };
+          return { dirent: e, score, matchedCandidatePath };
         });
 
         scored.sort((a, b) => {
@@ -1880,12 +2060,14 @@ async function inspectMissingPathDetails(target: string): Promise<MissingPathDet
         for (const item of scored) {
           if (candidates.length >= 3) break;
           if (item.score < 30) break;
-          if (!missingRemainder) {
-            candidates.push(path.join(parent, item.dirent.name));
-          } else if (item.dirent.isDirectory()) {
-            const subCand = path.join(parent, item.dirent.name, missingRemainder);
-            if (existsSync(subCand)) {
-              candidates.push(subCand);
+          if (item.matchedCandidatePath) {
+            if (!candidates.includes(item.matchedCandidatePath)) {
+              candidates.push(item.matchedCandidatePath);
+            }
+          } else if (!missingRemainder) {
+            const candidatePath = path.join(parent, item.dirent.name);
+            if (!candidates.includes(candidatePath)) {
+              candidates.push(candidatePath);
             }
           }
         }
@@ -2158,6 +2340,40 @@ export const tools: ToolDef[] = [
         throw new Error(`O diretorio de trabalho (cwd) informado em run_command nao e um diretorio: ${cwd}`);
       }
       const timeout = (args.timeout_ms as number | undefined) ?? 120_000;
+
+      // Controle v1.5.0: invocacoes sincronas de subagentes CLI longos (ex.: agy --print) sao executadas
+      // via job gerenciado para evitar que timeouts sincronos matem o subagente e descartem seu trabalho.
+      // Se concluir dentro da janela inicial (ate 30s), retorna normalmente; se continuar rodando, promove
+      // automaticamente para background job e retorna job_id + poll_hint sem encerrar o processo.
+      if (/^\s*agy\b[\s\S]*--print\b/.test(command)) {
+        const existingRunning = Array.from(backgroundJobs.values()).find(
+          (j) => j.status === "running" && j.cwd === cwd && j.command === command && isProcessAlive(j.pid),
+        );
+        const job = existingRunning ?? startBackgroundJob(command, cwd, Math.max(timeout, 1_200_000));
+        if (existingRunning) {
+          reattachedBackgroundJobs += 1;
+        }
+        const initialWaitMs = Math.min(timeout, 30_000);
+        await waitForJob(job, initialWaitMs);
+        if (job.status === "running") {
+          autoPromotedCommands += 1;
+          return formatJobResult(job, 0, undefined, undefined, Boolean(existingRunning), true);
+        }
+        job.polledByClient = true;
+        const fullStdout = Buffer.concat(job.stdoutChunks).toString("utf8");
+        const fullStderr = Buffer.concat(job.stderrChunks).toString("utf8");
+        const jobParts = [
+          `exit_code: ${job.exitCode}${job.timedOut ? " (timeout; grupo de processos encerrado)" : ""}`,
+          job.maxBufferExceeded
+            ? `output_limit_exceeded: true (MCP_COMMAND_MAX_BUFFER_BYTES=${configuredPositiveNumber("MCP_COMMAND_MAX_BUFFER_BYTES", DEFAULT_COMMAND_MAX_BUFFER_BYTES)})`
+            : "",
+          fullStdout ? `stdout:\n${fullStdout}` : "stdout: (vazio)",
+          fullStderr ? `stderr:\n${fullStderr}` : "",
+          job.errorMessage ? `error_message:\n${job.errorMessage}` : "",
+        ].filter(Boolean);
+        return commandResult(jobParts.join("\n"));
+      }
+
       const execution = await executeCommand(command, cwd, timeout);
       const parts = [
         `exit_code: ${execution.exitCode}${execution.timedOut ? " (timeout; grupo de processos encerrado)" : ""}`,
@@ -2273,6 +2489,9 @@ export const tools: ToolDef[] = [
 
       const job = startBackgroundJob(command, cwd, timeoutMs);
       await waitForJob(job, waitMs);
+      if (job.status !== "running") {
+        job.polledByClient = true;
+      }
       return formatJobResult(job, 0);
     },
   },
@@ -2323,6 +2542,7 @@ export const tools: ToolDef[] = [
       const offset = (args.offset as number | undefined) ?? 0;
       const stderrOffset = args.stderr_offset as number | undefined;
       if (kill) {
+        job.polledByClient = true;
         if (job.status === "running") {
           job.terminate(true);
           await waitForJob(job, 2_000);
@@ -2332,6 +2552,7 @@ export const tools: ToolDef[] = [
       } else {
         const waitMs = (args.wait_ms as number | undefined) ?? 60_000;
         await waitForJob(job, waitMs);
+        job.polledByClient = true;
       }
       return formatJobResult(job, offset, stderrOffset, autoCorrectedFrom);
     },

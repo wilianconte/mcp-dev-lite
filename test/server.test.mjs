@@ -84,6 +84,7 @@ test('servidor integra auth, sessoes MCP, auditoria, proxy e OAuth PKCE', { time
       MCP_AUDIT_STDERR: 'false',
       MCP_DATA_DIR: dataDir,
       MCP_TRUST_PROXY: 'loopback',
+      MCP_REQUEST_BODY_LIMIT: '1kb',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -96,7 +97,7 @@ test('servidor integra auth, sessoes MCP, auditoria, proxy e OAuth PKCE', { time
   try {
     const health = await waitForHealth(baseUrl, child);
     assert.equal(health.status, 'ok');
-    assert.equal(health.tools.length, 17);
+    assert.equal(health.tools, undefined, 'health nao deve enumerar ferramentas publicamente');
 
     const unauthorized = await fetch(`${baseUrl}/mcp`, {
       method: 'POST',
@@ -105,6 +106,27 @@ test('servidor integra auth, sessoes MCP, auditoria, proxy e OAuth PKCE', { time
     });
     assert.equal(unauthorized.status, 401);
     assert.match(unauthorized.headers.get('www-authenticate') ?? '', /resource_metadata=/);
+
+    const malformedAuthenticated = await fetch(`${baseUrl}/mcp`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${staticToken}`, 'content-type': 'application/json', accept: 'application/json' },
+      body: '{',
+    });
+    const malformedText = await malformedAuthenticated.text();
+    assert.equal(malformedAuthenticated.status, 400);
+    assert.match(malformedText, /SyntaxError|Unexpected end|entity.parse.failed/);
+    assert.doesNotMatch(malformedText, /<html/i);
+
+    const oversized = await fetch(`${baseUrl}/mcp`, {
+      method: 'POST',
+      headers: {
+        authorization: `Bearer ${staticToken}`,
+        'content-type': 'application/json',
+        accept: 'application/json, text/event-stream',
+      },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { padding: 'x'.repeat(2_000) } }),
+    });
+    assert.equal(oversized.status, 413, 'o limite configurado do corpo deve ser aplicado após autenticacao');
 
     const forwardedIp = '203.0.113.10';
     const initialized = await mcpPost(
@@ -142,6 +164,7 @@ test('servidor integra auth, sessoes MCP, auditoria, proxy e OAuth PKCE', { time
     assert.equal(callAudit.remote_ip, forwardedIp, 'trust proxy loopback deve usar X-Forwarded-For do proxy local');
     assert.equal(callAudit.args.path, root);
     assert.equal(callAudit.result.is_error, false);
+    assert.equal(callAudit.result.outcome, 'success');
 
     const registered = await fetch(`${baseUrl}/register`, {
       method: 'POST',
@@ -200,6 +223,10 @@ test('servidor integra auth, sessoes MCP, auditoria, proxy e OAuth PKCE', { time
     const tokens = await tokenResponse.json();
     assert.ok(tokens.access_token);
     assert.ok(tokens.refresh_token);
+    const persistedOAuthState = JSON.parse(await readFile(path.join(dataDir, 'oauth-state.json'), 'utf8'));
+    assert.equal(persistedOAuthState.tokenHashVersion, 1);
+    assert.doesNotMatch(await readFile(path.join(dataDir, 'oauth-state.json'), 'utf8'), new RegExp(tokens.access_token));
+    assert.doesNotMatch(await readFile(path.join(dataDir, 'oauth-state.json'), 'utf8'), new RegExp(tokens.refresh_token));
 
     const oauthInitialized = await mcpPost(
       baseUrl,
@@ -250,8 +277,75 @@ test('servidor integra auth, sessoes MCP, auditoria, proxy e OAuth PKCE', { time
     assert.equal(revokedUse.response.status, 401, 'access token revogado nao pode acessar /mcp');
 
     // Validacao do painel /logs (HTML), /logs/api (JSON) e /logs/stream (SSE em tempo real).
-    const logsHtmlRes = await fetch(`${baseUrl}/logs`, { headers: { accept: 'text/html' } });
+    const anonymousLogsRes = await fetch(`${baseUrl}/logs`, {
+      headers: { accept: 'text/html' },
+      redirect: 'manual',
+    });
+    assert.equal(anonymousLogsRes.status, 302, 'painel HTML sem credencial deve redirecionar para o login');
+    assert.equal(anonymousLogsRes.headers.get('location'), '/logs/login');
+
+    const loginPageRes = await fetch(`${baseUrl}/logs/login`, { headers: { accept: 'text/html' } });
+    assert.equal(loginPageRes.status, 200);
+    const loginPage = await loginPageRes.text();
+    assert.match(loginPage, /Entrar no MCP Monitor/);
+    assert.doesNotMatch(loginPage, new RegExp(staticToken));
+
+    const invalidLoginRes = await fetch(`${baseUrl}/logs/login`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded', accept: 'text/html' },
+      body: new URLSearchParams({ token: 'wrong-token' }),
+      redirect: 'manual',
+    });
+    assert.equal(invalidLoginRes.status, 401);
+    assert.equal(invalidLoginRes.headers.get('set-cookie'), null, 'login invalido nao deve emitir sessao');
+
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      const limitedAttempt = await fetch(`${baseUrl}/logs/login`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/x-www-form-urlencoded', accept: 'text/html', 'x-forwarded-for': '198.51.100.100' },
+        body: new URLSearchParams({ token: 'wrong-token' }),
+      });
+      assert.equal(limitedAttempt.status, 401);
+    }
+    const limitedLoginRes = await fetch(`${baseUrl}/logs/login`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded', accept: 'text/html', 'x-forwarded-for': '198.51.100.100' },
+      body: new URLSearchParams({ token: 'wrong-token' }),
+    });
+    assert.equal(limitedLoginRes.status, 429, 'login do painel deve aplicar limite por IP');
+
+    const loginRes = await fetch(`${baseUrl}/logs/login`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded', accept: 'text/html' },
+      body: new URLSearchParams({ token: staticToken }),
+      redirect: 'manual',
+    });
+    assert.equal(loginRes.status, 303);
+    assert.equal(loginRes.headers.get('location'), '/logs');
+    const loginCookie = loginRes.headers.get('set-cookie');
+    assert.match(loginCookie ?? '', /mcp_monitor_session=/);
+
+    const anonymousLogsApiRes = await fetch(`${baseUrl}/logs/api`);
+    assert.equal(anonymousLogsApiRes.status, 401, '/logs/api sem credencial deve exigir autenticacao');
+
+    const malformedCookieLogsRes = await fetch(`${baseUrl}/logs`, {
+      headers: { cookie: 'mcp_monitor_session=%' },
+    });
+    assert.equal(malformedCookieLogsRes.status, 401, 'cookie malformado deve ser rejeitado sem erro 500');
+
+    const staleHtmlCookieRes = await fetch(`${baseUrl}/logs`, {
+      headers: { accept: 'text/html', cookie: 'mcp_monitor_session=stale-session' },
+      redirect: 'manual',
+    });
+    assert.equal(staleHtmlCookieRes.status, 302, 'cookie HTML expirado deve redirecionar para login');
+    assert.equal(staleHtmlCookieRes.headers.get('location'), '/logs/login');
+    assert.match(staleHtmlCookieRes.headers.get('set-cookie') ?? '', /Max-Age=0/);
+
+    const logsHtmlRes = await fetch(`${baseUrl}/logs`, {
+      headers: { accept: 'text/html', cookie: loginCookie?.split(';', 1)[0] ?? '' },
+    });
     assert.equal(logsHtmlRes.status, 200);
+    const monitorCookie = loginCookie;
     assert.match(logsHtmlRes.headers.get('content-type') ?? '', /text\/html/);
     const logsHtml = await logsHtmlRes.text();
     assert.match(logsHtml, /MCP Monitor — \/logs/);
@@ -261,18 +355,24 @@ test('servidor integra auth, sessoes MCP, auditoria, proxy e OAuth PKCE', { time
     assert.match(logsHtml, /id="tab-btn-kpis"/);
     assert.match(logsHtml, /id="tab-panel-kpis"/);
     assert.match(logsHtml, /mcp_monitor_alert_cfg_v1/);
+    assert.match(logsHtml, /action="\/logs\/logout"/);
 
-    const kpisRes = await fetch(`${baseUrl}/logs/kpis?window=v1.5.0&compare=v1.4.9`);
+    const kpisRes = await fetch(`${baseUrl}/logs/kpis?window=v1.5.1&compare=v1.5.0`, {
+      headers: { cookie: loginCookie?.split(';', 1)[0] ?? '' },
+    });
     assert.equal(kpisRes.status, 200);
     const kpiReport = await kpisRes.json();
-    assert.equal(kpiReport.currentVersion, '1.5.0');
+    assert.equal(kpiReport.currentVersion, '1.5.1');
     assert.ok(kpiReport.current.reliability.totalCalls >= 1);
     assert.ok(kpiReport.cacheStats, 'kpiReport deve incluir estatisticas de cache zero-stale');
+    assert.ok(kpiReport.auditWriteStats.writes >= 1, 'kpiReport deve incluir latencia e contagem de escrita da auditoria');
     assert.equal(kpiReport.current.sampleReadiness.calls.target, 1500);
     assert.equal(kpiReport.current.sampleReadiness.edits.target, 200);
     assert.equal(kpiReport.current.sampleReadiness.polls.target, 80);
 
-    const logsApiRes = await fetch(`${baseUrl}/logs/api`);
+    const logsApiRes = await fetch(`${baseUrl}/logs/api`, {
+      headers: { cookie: loginCookie?.split(';', 1)[0] ?? '' },
+    });
     assert.equal(logsApiRes.status, 200);
     const snapshot = await logsApiRes.json();
     assert.equal(snapshot.server.name, 'mcp-dev-agent');
@@ -286,7 +386,10 @@ test('servidor integra auth, sessoes MCP, auditoria, proxy e OAuth PKCE', { time
 
     // Testa stream SSE (/logs/stream) recebendo snapshot inicial + nova transacao em tempo real.
     const sseAbort = new AbortController();
-    const sseResponse = await fetch(`${baseUrl}/logs/stream`, { signal: sseAbort.signal });
+    const sseResponse = await fetch(`${baseUrl}/logs/stream`, {
+      headers: { cookie: monitorCookie?.split(';', 1)[0] ?? '' },
+      signal: sseAbort.signal,
+    });
     assert.equal(sseResponse.status, 200);
     assert.match(sseResponse.headers.get('content-type') ?? '', /text\/event-stream/);
     const reader = sseResponse.body.getReader();
@@ -314,6 +417,20 @@ test('servidor integra auth, sessoes MCP, auditoria, proxy e OAuth PKCE', { time
 
     await readUntil((buf) => buf.includes('event: transaction') && buf.includes('"tool":"make_directory"') && buf.includes('"status":"ok"'));
     sseAbort.abort();
+
+    const logoutRes = await fetch(`${baseUrl}/logs/logout`, {
+      method: 'POST',
+      headers: { cookie: loginCookie?.split(';', 1)[0] ?? '' },
+      redirect: 'manual',
+    });
+    assert.equal(logoutRes.status, 303);
+    assert.equal(logoutRes.headers.get('location'), '/logs/login');
+    assert.match(logoutRes.headers.get('set-cookie') ?? '', /Max-Age=0/);
+
+    const afterLogout = await fetch(`${baseUrl}/logs/api`, {
+      headers: { cookie: loginCookie?.split(';', 1)[0] ?? '' },
+    });
+    assert.equal(afterLogout.status, 401, 'sessao encerrada nao deve continuar acessando o painel');
   } finally {
     child.kill('SIGTERM');
     await new Promise((resolve) => {

@@ -22,12 +22,17 @@ Este documento é o runbook do `mcp-dev-agent`.
 | `MCP_MAX_IMAGE_BYTES` | Não | `10485760` | Tamanho máximo de imagem lida por `read_image`. |
 | `MCP_MAX_TEXT_FILE_BYTES` | Não | `10485760` | Tamanho máximo de arquivo de texto lido por `read_file` / `read_files`. |
 | `MCP_COMMAND_MAX_BUFFER_BYTES` | Não | `52428800` | Máximo combinado capturado de stdout/stderr por comando. |
+| `MCP_REQUEST_BODY_LIMIT` | Não | `16mb` | Limite do corpo JSON aceito em `POST /mcp`, aplicado depois da autenticação. |
 | `MCP_TRUST_PROXY` | Não | `loopback` | Proxies confiáveis pelo Express; `loopback` é o recomendado com cloudflared local. |
 | `MCP_AUDIT_LOG_PATH` | Não | `./data/audit.jsonl` | Arquivo JSONL para auditoria de `tools/call`. |
 | `MCP_AUDIT_MAX_BYTES` | Não | `20971520` | Limite em bytes antes de rotacionar `audit.jsonl` para `audit.jsonl.1` (padrão 20 MiB). |
 | `MCP_AUDIT_STDERR` | Não | `true` | Envia eventos estruturados também para stderr/journald. |
 | `MCP_LOG_PROTOCOL_EVENTS` | Não | `false` | Quando `true`, inclui handshakes de protocolo (`mcp.initialize`, `mcp.sse_open`, `mcp.tools_list`) na lista de transações em `/logs`. |
-| `MCP_DATA_DIR` | Não | `./data` relativo ao projeto | Sobrescreve o diretório de estado OAuth; útil em testes/isolamento. |
+| `MCP_DATA_DIR` | Não | `./data` relativo ao projeto | Diretório base privado para estado OAuth, auditoria e outros estados locais. |
+| `MCP_JOB_STORE_DIR` | Não | `/tmp/mcp-dev-agent-jobs` | Diretório privado para snapshots de jobs em segundo plano. |
+| `MCP_COMMAND_ENV_MODE` | Não | `full` | `full` preserva o ambiente do processo. `sanitized` remove variáveis com nomes de token, senha, segredo, chave, credencial, cookie ou autenticação. |
+| `MCP_MONITOR_LOGIN_MAX_ATTEMPTS` | Não | `10` | Tentativas de login do painel por IP em uma janela de 15 minutos. |
+| `MCP_RUN_USER` | Não | `root` | Usuário usado pelo script de renderização do unit systemd. O unit precisa ser regerado após a alteração. |
 
 Valores de tamanho são em bytes.
 
@@ -67,7 +72,23 @@ npm run build
 npm start
 ```
 
-O template systemd está em `deploy/mcp-dev-agent.service`. O guia de túnel está em [`DEPLOY-CLOUDFLARE.md`](./DEPLOY-CLOUDFLARE.md).
+O template systemd está em `deploy/mcp-dev-agent.service`. Gere uma unidade configurada com `MCP_REPO_DIR`, `MCP_ENV_FILE`, `MCP_RUN_USER`, `MCP_NODE_BIN`, `MCP_PORT`, `MCP_PUBLIC_URL` e `MCP_DATA_DIR` usando `scripts/render-systemd-unit.sh`.
+
+```bash
+MCP_REPO_DIR=/root/repos/mcp-dev-lite \
+MCP_ENV_FILE=/root/repos/mcp-dev/.env \
+MCP_RUN_USER=root \
+MCP_NODE_BIN=/root/.nvm/versions/node/v22.23.1/bin \
+MCP_PORT=3001 \
+MCP_PUBLIC_URL=https://mcp-lite.criaelo.com \
+MCP_DATA_DIR=/root/repos/mcp-dev-lite/data \
+scripts/render-systemd-unit.sh /tmp/mcp-dev-lite-agent.service
+sudo install -m 0644 /tmp/mcp-dev-lite-agent.service /etc/systemd/system/mcp-dev-lite-agent.service
+sudo systemctl daemon-reload
+sudo systemctl restart mcp-dev-lite-agent.service
+```
+
+O guia de túnel está em [`DEPLOY-CLOUDFLARE.md`](./DEPLOY-CLOUDFLARE.md).
 
 ## Health check
 
@@ -78,28 +99,11 @@ Exemplo esperado:
 ```json
 {
   "status": "ok",
-  "tools": [
-    "run_command",
-    "read_command_output",
-    "start_command",
-    "poll_command",
-    "read_file",
-    "read_files",
-    "search_code",
-    "find_files",
-    "read_image",
-    "write_file",
-    "edit_file",
-    "multi_edit_file",
-    "list_directory",
-    "move_file",
-    "make_directory",
-    "delete_path"
-  ]
+  "version": "1.5.1"
 }
 ```
 
-Esse endpoint confirma que o processo HTTP está respondendo e mostra o catálogo registrado. Ele não valida execução de shell, escrita em disco, OAuth ou conectividade do túnel.
+Esse endpoint confirma que o processo HTTP está respondendo. Ele não enumera ferramentas nem valida execução de shell, escrita em disco, OAuth ou conectividade do túnel.
 
 ## Validação antes de publicar
 
@@ -107,7 +111,10 @@ Execute:
 
 ```bash
 npm run typecheck
+npm run lint
+npm run format:check
 npm test
+npm run test:coverage
 ```
 
 Depois valide:
@@ -120,9 +127,11 @@ Por fim, faça um handshake MCP autenticado conforme o exemplo do README.
 
 ## Logs e Painel em Tempo Real (`/logs`)
 
-O servidor disponibiliza uma interface web em `/logs` (protegida por sessão de cookie autenticada com `OAUTH_APPROVAL_PASSWORD` ou `MCP_AUTH_TOKEN`, ou via `Authorization: Bearer`) com duas abas principais:
+O servidor disponibiliza uma interface web em `/logs`. Ao abrir a rota no navegador sem sessão, o servidor redireciona para `/logs/login`, onde o operador informa o mesmo valor de `MCP_AUTH_TOKEN`. A validação ocorre no servidor e a sessão é mantida por cookie `HttpOnly` temporário. O token não é armazenado no navegador. Também é possível autenticar chamadas técnicas com `Authorization: Bearer`. O cookie permite que o `EventSource` do painel mantenha o SSE sem expor o Bearer ao JavaScript. O painel possui duas abas principais:
 - **Conexões**: sessões MCP ativas, cliente conectado, IP, contadores de chamadas/erros e atividade em andamento;
 - **Transações (Logs em Tempo Real)**: stream SSE (`/logs/stream`) e histórico (`/logs/api`) com filtros de busca, status, ferramenta, sessão e modal de detalhes completos da requisição/resposta.
+
+O botão **Sair** envia `POST /logs/logout`, invalida a sessão em memória e redireciona para a tela de login.
 
 Além disso, a aplicação escreve em stdout/stderr:
 
@@ -140,7 +149,7 @@ journalctl -u mcp-dev-agent -f
 journalctl -u mcp-dev-agent --since today
 ```
 
-Para persistir auditoria fora do journald, configure `MCP_AUDIT_LOG_PATH` (padrão `./data/audit.jsonl`). Os registros são JSON Lines e têm redaction de campos/padrões sensíveis.
+A auditoria é persistida por padrão em `./data/audit.jsonl` e enviada ao stderr/journald. Configure `MCP_AUDIT_LOG_PATH` para escolher outro caminho ou use `false` para desativar a cópia em arquivo. Os registros são JSON Lines e têm redaction de campos/padrões sensíveis.
 
 ## Diagnóstico rápido
 

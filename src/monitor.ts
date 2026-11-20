@@ -4,9 +4,11 @@ import { Router, type Request, type Response } from "express";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import {
   MCP_SERVER_VERSION,
+  getAuditWriteStats,
   sanitizeAuditValue,
   summarizeToolResult,
   truncateString,
+  type ToolOutcome,
   type ToolResultSummary,
 } from "./audit.js";
 import { getInternalCacheStats, type InternalCacheAndControlStats } from "./tools.js";
@@ -27,6 +29,8 @@ export type KpiErrorKind =
   | "enoent"
   | "invalid_job_id"
   | "sync_timeout"
+  | "command_nonzero_exit"
+  | "output_limit"
   | "other";
 
 export interface KpiCallEntry {
@@ -36,6 +40,7 @@ export interface KpiCallEntry {
   tool: string;
   durationMs: number;
   isError: boolean;
+  outcome: ToolOutcome;
   errorKind?: KpiErrorKind;
   errorMsg?: string;
   textChars: number;
@@ -50,6 +55,10 @@ export interface KpiCallEntry {
   manualNvmPath?: boolean;
   shellAntiPattern?: boolean;
   targetSummary?: string;
+  sessionId?: string;
+  clientId?: string;
+  requestId?: string | number;
+  jobId?: string;
 }
 
 export interface KpiSampleReadiness {
@@ -158,6 +167,8 @@ export interface KpiWindowMetrics {
       enoent: number;
       invalidJobId: number;
       syncTimeout: number;
+      commandNonzeroExit: number;
+      outputLimit: number;
       other: number;
     };
     recentErrors: Array<{
@@ -173,6 +184,8 @@ export interface KpiWindowMetrics {
 export interface KpiComparisonReport {
   generatedAt: string;
   currentVersion: string;
+  hydrationStatus: "not_started" | "loading" | "ready";
+  hydratedAuditEntries: number;
   windowKey: string;
   compareKey: string;
   versionCounts: Record<string, number>;
@@ -182,6 +195,7 @@ export interface KpiComparisonReport {
     kpiCacheHits: number;
     kpiCacheMisses: number;
   };
+  auditWriteStats: ReturnType<typeof getAuditWriteStats>;
 }
 
 function inferAuditVersion(rawVersion: unknown, tsMs: number): string {
@@ -194,15 +208,29 @@ function inferAuditVersion(rawVersion: unknown, tsMs: number): string {
   return "pre-1.4.3";
 }
 
-function classifyErrorKind(tool: string, errMsg: string, timedOut: boolean): KpiErrorKind {
+function classifyErrorKind(tool: string, errMsg: string, timedOut: boolean, outcome: ToolOutcome): KpiErrorKind {
   if (timedOut || (/timeout/i.test(errMsg) && (tool === "run_command" || tool === "start_command"))) {
     return "sync_timeout";
   }
+  if (outcome === "command_nonzero_exit") return "command_nonzero_exit";
+  if (outcome === "output_limit") return "output_limit";
   if (/aparece\s+\d+\s+vezes/i.test(errMsg)) return "multiple_occurrences";
   if (/old_string\s+nao\s+encontrado/i.test(errMsg)) return "missing_old_string";
   if (/ENOENT|Caminho\s+inexistente|nao\s+existe|no\s+such\s+file/i.test(errMsg)) return "enoent";
   if (/job_id.*nao\s+encontrado|Job\s+(?:.*\s+)?nao\s+encontrado/i.test(errMsg)) return "invalid_job_id";
   return "other";
+}
+
+function inferOutcome(resultObj: ToolResultSummary | undefined, rawError: string): ToolOutcome {
+  if (rawError) return "tool_error";
+  if (resultObj?.outcome) return resultObj.outcome;
+  if (resultObj?.timed_out || resultObj?.exit_code === "timeout") return "timeout";
+  if (resultObj?.exit_code === "killed" || resultObj?.job_status === "killed") return "killed";
+  if (resultObj?.exit_code === "output_limit" || resultObj?.job_status === "output_limit") return "output_limit";
+  if (typeof resultObj?.exit_code === "number" && resultObj.exit_code !== 0) return "command_nonzero_exit";
+  if (resultObj?.is_error) return "tool_error";
+  if (resultObj?.job_status === "running" || resultObj?.exit_code === "running") return "running";
+  return "success";
 }
 
 function percentile(sorted: number[], p: number): number {
@@ -228,7 +256,8 @@ function buildKpiEntryFromAudit(parsed: Record<string, unknown>): KpiCallEntry |
   const durationMs = typeof parsed.duration_ms === "number" ? Math.max(0, parsed.duration_ms) : 0;
   const resultObj = (parsed.result as ToolResultSummary | undefined) ?? undefined;
   const rawError = typeof parsed.error === "string" ? parsed.error : "";
-  const isError = Boolean(rawError) || Boolean(resultObj?.is_error);
+  const outcome = inferOutcome(resultObj, rawError);
+  const isError = outcome !== "success" && outcome !== "running" && outcome !== "killed";
   const timedOut = Boolean(resultObj?.timed_out);
   const textChars = typeof resultObj?.text_chars === "number" ? resultObj.text_chars : 0;
   const args = (parsed.args && typeof parsed.args === "object" ? parsed.args : {}) as Record<string, unknown>;
@@ -267,7 +296,7 @@ function buildKpiEntryFromAudit(parsed: Record<string, unknown>): KpiCallEntry |
   else if (!targetSummary && typeof args.job_id === "string") targetSummary = `job_id=${args.job_id}`;
   else if (!targetSummary && targetPaths && targetPaths.length > 0) targetSummary = `${targetPaths.length} arqs (${targetPaths[0]})`;
 
-  const errorKind = isError ? classifyErrorKind(tool, rawError, timedOut) : undefined;
+  const errorKind = isError ? classifyErrorKind(tool, rawError, timedOut, outcome) : undefined;
   const errorMsg = isError ? (rawError ? rawError.split("\n")[0].slice(0, 220) : "Erro na ferramenta") : undefined;
 
   return {
@@ -277,6 +306,7 @@ function buildKpiEntryFromAudit(parsed: Record<string, unknown>): KpiCallEntry |
     tool,
     durationMs,
     isError,
+    outcome,
     ...(errorKind ? { errorKind } : {}),
     ...(errorMsg ? { errorMsg } : {}),
     textChars,
@@ -291,6 +321,16 @@ function buildKpiEntryFromAudit(parsed: Record<string, unknown>): KpiCallEntry |
     ...(manualNvmPath ? { manualNvmPath: true } : {}),
     ...(shellAntiPattern ? { shellAntiPattern: true } : {}),
     ...(targetSummary ? { targetSummary } : {}),
+    ...(typeof parsed.session_id === "string" ? { sessionId: parsed.session_id } : {}),
+    ...(typeof parsed.client_id === "string" ? { clientId: parsed.client_id } : {}),
+    ...((typeof parsed.request_id === "string" || typeof parsed.request_id === "number")
+      ? { requestId: parsed.request_id }
+      : {}),
+    ...(typeof resultObj?.job_id === "string"
+      ? { jobId: resultObj.job_id }
+      : typeof args.job_id === "string"
+        ? { jobId: args.job_id }
+        : {}),
   };
 }
 
@@ -322,8 +362,11 @@ const NATIVE_READ_SEARCH_TOOLS = new Set([
 
 function filterKpiEntriesByWindow(entries: KpiCallEntry[], windowKey: string, nowMs = Date.now()): { list: KpiCallEntry[]; label: string } {
   const norm = (windowKey || `v${MCP_SERVER_VERSION}`).trim();
+  if (norm === "v1.5.1" || norm === "1.5.1") {
+    return { list: entries.filter((e) => e.version === "1.5.1"), label: "Versao v1.5.1 (Atual)" };
+  }
   if (norm === "v1.5.0" || norm === "1.5.0") {
-    return { list: entries.filter((e) => e.version === "1.5.0"), label: "Versao v1.5.0 (Atual)" };
+    return { list: entries.filter((e) => e.version === "1.5.0"), label: "Versao v1.5.0 (16/nov–18/nov)" };
   }
   if (norm === "v1.4.9" || norm === "1.4.9") {
     return { list: entries.filter((e) => e.version === "1.4.9"), label: "Versao v1.4.9 (13/nov–16/nov)" };
@@ -363,7 +406,7 @@ function filterKpiEntriesByWindow(entries: KpiCallEntry[], windowKey: string, no
   if (norm === "all") {
     return { list: entries, label: "Todo o historico" };
   }
-  return { list: entries.filter((e) => e.version === "1.4.9"), label: "Versao v1.4.9 (Atual)" };
+  return { list: entries.filter((e) => e.version === "1.5.1"), label: "Versao v1.5.1 (Atual)" };
 }
 
 function computeKpiWindowMetrics(entries: KpiCallEntry[], windowKey: string, windowLabel: string): KpiWindowMetrics {
@@ -390,6 +433,7 @@ function computeKpiWindowMetrics(entries: KpiCallEntry[], windowKey: string, win
   let incrementalOffsetPolls = 0;
   let autoCorrectedJobIds = 0;
   let compactedWatchFrames = 0;
+  const startedJobIds = new Set<string>();
 
   let runCommandCalls = 0;
   let manualNvmCalls = 0;
@@ -414,6 +458,8 @@ function computeKpiWindowMetrics(entries: KpiCallEntry[], windowKey: string, win
     enoent: 0,
     invalidJobId: 0,
     syncTimeout: 0,
+    commandNonzeroExit: 0,
+    outputLimit: 0,
     other: 0,
   };
   const recentErrors: Array<{ timestamp: string; tool: string; target: string; error: string; kind: KpiErrorKind }> = [];
@@ -459,6 +505,8 @@ function computeKpiWindowMetrics(entries: KpiCallEntry[], windowKey: string, win
       else if (kind === "enoent") errorBreakdown.enoent += 1;
       else if (kind === "invalid_job_id") errorBreakdown.invalidJobId += 1;
       else if (kind === "sync_timeout") errorBreakdown.syncTimeout += 1;
+      else if (kind === "command_nonzero_exit") errorBreakdown.commandNonzeroExit += 1;
+      else if (kind === "output_limit") errorBreakdown.outputLimit += 1;
       else errorBreakdown.other += 1;
 
       recentErrors.push({
@@ -490,6 +538,7 @@ function computeKpiWindowMetrics(entries: KpiCallEntry[], windowKey: string, win
       totalReadBatchFiles += e.batchCount ?? 1;
     } else if (e.tool === "start_command") {
       startCommandCalls += 1;
+      if (e.jobId) startedJobIds.add(e.jobId);
       if (e.manualNvmPath) manualNvmCalls += 1;
       if (e.compactedFrames) compactedWatchFrames += e.compactedFrames;
     } else if (e.tool === "poll_command") {
@@ -521,6 +570,10 @@ function computeKpiWindowMetrics(entries: KpiCallEntry[], windowKey: string, win
       for (let j = i + 1; j <= maxLookahead; j += 1) {
         const next = entries[j];
         if (next.tsMs - e.tsMs > 10 * 60_000) break;
+        const sameContext =
+          (next.sessionId ?? null) === (e.sessionId ?? null) &&
+          (next.clientId ?? null) === (e.clientId ?? null);
+        if (!sameContext) continue;
         if (next.tool === "read_file" && next.targetPath === e.targetPath) {
           usedReadOnTarget = true;
         } else if (next.tool === "read_files" && next.targetPaths?.includes(e.targetPath)) {
@@ -550,7 +603,8 @@ function computeKpiWindowMetrics(entries: KpiCallEntry[], windowKey: string, win
 
   const pollSuccessPct =
     pollCommandCalls > 0 ? round2(((pollCommandCalls - pollErrors) / pollCommandCalls) * 100) : 100;
-  const pollsPerJob = startCommandCalls > 0 ? round2(pollCommandCalls / startCommandCalls) : 0;
+  const trackedJobCount = startedJobIds.size > 0 ? startedJobIds.size : startCommandCalls;
+  const pollsPerJob = trackedJobCount > 0 ? round2(pollCommandCalls / trackedJobCount) : 0;
   const longWaitPollPct = pollCommandCalls > 0 ? round1((longWaitPolls / pollCommandCalls) * 100) : 100;
   const incrementalOffsetPct = pollCommandCalls > 0 ? round1((incrementalOffsetPolls / pollCommandCalls) * 100) : 0;
 
@@ -782,6 +836,10 @@ export interface MonitorSnapshot {
     uptimeSec: number;
   };
   stats: MonitorStats;
+  history: {
+    hydrationStatus: "not_started" | "loading" | "ready";
+    hydratedAuditEntries: number;
+  };
   sessions: SessionSnapshot[];
   transactions: TransactionRecord[];
   kpis?: KpiComparisonReport;
@@ -809,6 +867,8 @@ export class McpMonitor {
   private totalErrorsSeen = 0;
   private totalDurationMs = 0;
   private completedToolCallsCount = 0;
+  private hydrationStatus: "not_started" | "loading" | "ready" = "not_started";
+  private hydratedAuditEntries = 0;
 
   constructor(maxTransactions?: number) {
     const envLimit = Number(process.env.MCP_LOG_BUFFER_SIZE ?? DEFAULT_MAX_TRANSACTIONS);
@@ -826,7 +886,7 @@ export class McpMonitor {
 
   private getCachedWindowMetrics(windowKey: string, nowMs: number): KpiWindowMetrics {
     const isHistoricalStaticVersion =
-      /^v?1\.4\.[3-8]$|^pre-1\.4\.3$/i.test(windowKey.trim()) &&
+      /^v?1\.(?:4\.[3-9]|5\.0)$|^pre-1\.4\.3$/i.test(windowKey.trim()) &&
       windowKey.trim().replace(/^v/i, "") !== MCP_SERVER_VERSION;
     const cached = this.kpiWindowCache.get(windowKey);
     if (
@@ -875,7 +935,11 @@ export class McpMonitor {
 
   /** Carrega registros do arquivo JSONL de auditoria para popular o motor de KPIs e o historico de transacoes recentes. */
   async hydrateFromAuditFile(filePath: string | null): Promise<void> {
-    if (!filePath) return;
+    this.hydrationStatus = "loading";
+    if (!filePath) {
+      this.hydrationStatus = "ready";
+      return;
+    }
     try {
       const rotatedLines = await this.readAuditLinesFromFile(`${filePath}.1`);
       const currentLines = await this.readAuditLinesFromFile(filePath);
@@ -890,6 +954,7 @@ export class McpMonitor {
           const kpiEntry = buildKpiEntryFromAudit(parsed);
           if (kpiEntry) {
             this.pushKpiEntry(kpiEntry);
+            this.hydratedAuditEntries += 1;
           }
 
           if (i >= recentStartIndex) {
@@ -897,7 +962,7 @@ export class McpMonitor {
             const durationMs = typeof parsed.duration_ms === "number" ? parsed.duration_ms : 0;
             const finishedMs = Date.parse(ts) || Date.now();
             const resultObj = parsed.result as ToolResultSummary | undefined;
-            const isErr = Boolean(parsed.error) || Boolean(resultObj?.is_error);
+            const isErr = kpiEntry?.isError ?? (Boolean(parsed.error) || Boolean(resultObj?.is_error));
             const record: TransactionRecord = {
               id: randomUUID(),
               timestamp: ts,
@@ -928,6 +993,8 @@ export class McpMonitor {
       }
     } catch {
       // Arquivo ainda nao existe; ignora.
+    } finally {
+      this.hydrationStatus = "ready";
     }
   }
 
@@ -1077,7 +1144,12 @@ export class McpMonitor {
       );
     }
 
-    const isError = Boolean(outcome.error) || Boolean(record.result?.is_error);
+    const isError =
+      Boolean(outcome.error) ||
+      (record.result?.outcome !== undefined &&
+        record.result.outcome !== "success" &&
+        record.result.outcome !== "running" &&
+        record.result.outcome !== "killed");
     record.status = isError ? "error" : "ok";
 
     this.completedToolCallsCount += 1;
@@ -1093,6 +1165,9 @@ export class McpMonitor {
         args: record.args,
         result: record.result,
         error: record.error,
+        session_id: record.sessionId,
+        request_id: record.requestId,
+        client_id: record.clientId,
       });
       if (kpiEntry) {
         this.pushKpiEntry(kpiEntry);
@@ -1170,13 +1245,14 @@ export class McpMonitor {
     };
   }
 
-  getKpiReport(windowKey = "v1.5.0", compareKey = "v1.4.9"): KpiComparisonReport {
+  getKpiReport(windowKey = `v${MCP_SERVER_VERSION}`, compareKey = "v1.5.0"): KpiComparisonReport {
     const nowMs = Date.now();
     let versionCounts: Record<string, number>;
     if (this.kpiVersionCountsCache && this.kpiVersionCountsCache.seq === this.kpiMutationSeq) {
       versionCounts = { ...this.kpiVersionCountsCache.counts };
     } else {
       versionCounts = {
+        [MCP_SERVER_VERSION]: 0,
         "1.5.0": 0,
         "1.4.9": 0,
         "1.4.8": 0,
@@ -1204,6 +1280,8 @@ export class McpMonitor {
     return {
       generatedAt: new Date(nowMs).toISOString(),
       currentVersion: MCP_SERVER_VERSION,
+      hydrationStatus: this.hydrationStatus,
+      hydratedAuditEntries: this.hydratedAuditEntries,
       windowKey,
       compareKey,
       versionCounts,
@@ -1214,6 +1292,7 @@ export class McpMonitor {
         kpiCacheHits: this.kpiCacheHits,
         kpiCacheMisses: this.kpiCacheMisses,
       },
+      auditWriteStats: getAuditWriteStats(),
     };
   }
 
@@ -1230,10 +1309,14 @@ export class McpMonitor {
         uptimeSec: Math.floor((Date.now() - this.startedAtMs) / 1000),
       },
       stats: this.getStats(),
+      history: {
+        hydrationStatus: this.hydrationStatus,
+        hydratedAuditEntries: this.hydratedAuditEntries,
+      },
       sessions,
       // Mais recentes primeiro na listagem inicial.
       transactions: [...this.transactions].reverse(),
-      kpis: this.getKpiReport("v1.5.0", "v1.4.9"),
+      kpis: this.getKpiReport(`v${MCP_SERVER_VERSION}`, "v1.5.0"),
     };
   }
 
@@ -1259,8 +1342,8 @@ export class McpMonitor {
 
     router.get("/logs/kpis", (req: Request, res: Response) => {
       res.setHeader("Cache-Control", "no-store");
-      const windowKey = typeof req.query.window === "string" ? req.query.window : "v1.5.0";
-      const compareKey = typeof req.query.compare === "string" ? req.query.compare : "v1.4.9";
+      const windowKey = typeof req.query.window === "string" ? req.query.window : "v1.5.1";
+      const compareKey = typeof req.query.compare === "string" ? req.query.compare : "v1.5.0";
       res.json(this.getKpiReport(windowKey, compareKey));
     });
 
@@ -1304,6 +1387,62 @@ export class McpMonitor {
 
     return router;
   }
+}
+
+function escapeHtml(value: string): string {
+  return value.replace(/[&<>"']/g, (char) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#39;",
+  })[char] ?? char);
+}
+
+export function renderMonitorLoginHtml(errorMessage?: string): string {
+  const errorBlock = errorMessage
+    ? `<div class="error" role="alert">${escapeHtml(errorMessage)}</div>`
+    : "";
+  return `<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Entrar no MCP Monitor</title>
+<style>
+  :root { color-scheme: dark; --bg:#090d16; --panel:#111827; --border:#263449; --text:#f3f4f6; --muted:#9ca3af; --accent:#38bdf8; --err:#ef4444; }
+  * { box-sizing:border-box; }
+  body { margin:0; min-height:100vh; display:grid; place-items:center; padding:24px; background:radial-gradient(circle at top, #172554, var(--bg) 58%); color:var(--text); font-family:Inter, ui-sans-serif, system-ui, sans-serif; }
+  main { width:min(100%, 420px); }
+  .card { background:rgba(17,24,39,.96); border:1px solid var(--border); border-radius:16px; padding:32px; box-shadow:0 24px 80px rgba(0,0,0,.35); }
+  h1 { margin:0 0 8px; font-size:24px; letter-spacing:-.02em; }
+  p { margin:0 0 24px; color:var(--muted); line-height:1.5; }
+  label { display:block; margin-bottom:8px; font-size:13px; font-weight:700; }
+  input { width:100%; border:1px solid var(--border); border-radius:9px; background:#0b1220; color:var(--text); padding:12px 13px; font:inherit; }
+  input:focus { outline:2px solid var(--accent); outline-offset:2px; }
+  button { width:100%; margin-top:18px; border:0; border-radius:9px; padding:12px 14px; background:var(--accent); color:#082f49; font:700 14px inherit; cursor:pointer; }
+  button:hover { filter:brightness(1.08); }
+  .error { margin:0 0 18px; border:1px solid rgba(239,68,68,.45); border-radius:9px; padding:10px 12px; background:rgba(239,68,68,.12); color:#fecaca; font-size:13px; }
+  .hint { margin-top:18px; font-size:12px; }
+</style>
+</head>
+<body>
+<main>
+  <section class="card" aria-labelledby="login-title">
+    <h1 id="login-title">Entrar no MCP Monitor</h1>
+    <p>Use o token de autenticação configurado no servidor para acessar o painel operacional.</p>
+    ${errorBlock}
+    <form action="/logs/login" method="post">
+      <label for="monitor-token">Token de autenticação</label>
+      <input id="monitor-token" name="token" type="password" autocomplete="current-password" required autofocus>
+      <button type="submit">Entrar</button>
+    </form>
+    <p class="hint">A sessão é temporária e o token não fica armazenado no navegador.</p>
+  </section>
+</main>
+</body>
+</html>`;
 }
 
 function renderLogsDashboardHtml(): string {
@@ -1384,6 +1523,7 @@ function renderLogsDashboardHtml(): string {
     gap: 8px;
     flex-wrap: wrap;
   }
+  .logout-form { display: inline; margin: 0; }
   button, select, input[type="search"] {
     background: var(--panel-alt);
     color: var(--text);
@@ -1892,6 +2032,7 @@ function renderLogsDashboardHtml(): string {
     <button id="btn-pause" type="button">Pausar stream</button>
     <button id="btn-clear" type="button">Limpar tela</button>
     <button id="btn-export" type="button">Exportar JSON</button>
+    <form class="logout-form" action="/logs/logout" method="post"><button id="btn-logout" type="submit">Sair</button></form>
   </div>
 </header>
 
@@ -2200,7 +2341,8 @@ function renderLogsDashboardHtml(): string {
       <div class="filter-controls">
         <label class="muted" style="font-size:12px;font-weight:600;text-transform:uppercase;">Janela / Versao:</label>
         <select id="kpi-window-select">
-          <option value="v1.5.0" selected>Versao Atual (v1.5.0)</option>
+          <option value="v1.5.1" selected>Versao Atual (v1.5.1)</option>
+          <option value="v1.5.0">Versao v1.5.0 (16/nov–18/nov)</option>
           <option value="v1.4.9">Versao v1.4.9 (13/nov–16/nov)</option>
           <option value="v1.4.8">Versao v1.4.8 (12/nov–13/nov)</option>
           <option value="v1.4.7">Versao v1.4.7 (11/nov–12/nov)</option>
@@ -2216,7 +2358,8 @@ function renderLogsDashboardHtml(): string {
 
         <label class="muted" style="font-size:12px;font-weight:600;text-transform:uppercase;margin-left:8px;">Comparar com:</label>
         <select id="kpi-compare-select">
-          <option value="v1.4.9" selected>Baseline v1.4.9</option>
+          <option value="v1.5.0" selected>Baseline v1.5.0</option>
+          <option value="v1.4.9">Baseline v1.4.9</option>
           <option value="v1.4.8">Baseline v1.4.8</option>
           <option value="v1.4.7">Baseline v1.4.7</option>
           <option value="v1.4.6">Baseline v1.4.6</option>
@@ -3173,8 +3316,13 @@ function renderLogsDashboardHtml(): string {
     const b = report.baseline;
     const vc = report.versionCounts || {};
     const cs = report.cacheStats || {};
+    const hydrationLabel = report.hydrationStatus === 'loading'
+      ? 'histórico carregando'
+      : report.hydrationStatus === 'ready'
+        ? 'histórico pronto (' + (report.hydratedAuditEntries || 0) + ' registros)'
+        : 'histórico não iniciado';
     el('kpi-version-counts').textContent =
-      'v1.5.0: ' + (vc['1.5.0'] || 0) + ' | v1.4.9: ' + (vc['1.4.9'] || 0) + ' | v1.4.8: ' + (vc['1.4.8'] || 0) + ' | v1.4.7: ' + (vc['1.4.7'] || 0) + ' | v1.4.6: ' + (vc['1.4.6'] || 0) + ' | v1.4.5: ' + (vc['1.4.5'] || 0) + ' | v1.4.4: ' + (vc['1.4.4'] || 0) + ' | v1.4.3: ' + (vc['1.4.3'] || 0) + ' | pre-1.4.3: ' + (vc['pre-1.4.3'] || 0);
+      'v1.5.1: ' + (vc['1.5.1'] || 0) + ' | v1.5.0: ' + (vc['1.5.0'] || 0) + ' | v1.4.9: ' + (vc['1.4.9'] || 0) + ' | v1.4.8: ' + (vc['1.4.8'] || 0) + ' | v1.4.7: ' + (vc['1.4.7'] || 0) + ' | v1.4.6: ' + (vc['1.4.6'] || 0) + ' | v1.4.5: ' + (vc['1.4.5'] || 0) + ' | v1.4.4: ' + (vc['1.4.4'] || 0) + ' | v1.4.3: ' + (vc['1.4.3'] || 0) + ' | pre-1.4.3: ' + (vc['pre-1.4.3'] || 0) + ' • ' + hydrationLabel;
 
     const sr = c.sampleReadiness;
     const rBadge = el('kpi-readiness-badge');
@@ -3252,6 +3400,7 @@ function renderLogsDashboardHtml(): string {
         delta: b ? renderDeltaBadge(c.reliability.successRatePct, b.reliability.successRatePct, ' p.p.', true) : '',
         rows: [
           ['Total de chamadas / Erros', c.reliability.totalCalls + ' / ' + c.reliability.totalErrors + ' (' + c.reliability.errorRatePct + '%)'],
+          ['Saidas de comando nao zero', c.diagnostics.errorBreakdown.commandNonzeroExit + ' resultado(s) classificados como falha operacional'],
           ['Baseline (' + (b ? b.windowKey : 'n/a') + ')', b ? (b.reliability.successRatePct.toFixed(2) + '% (' + b.reliability.totalErrors + ' erros em ' + b.reliability.totalCalls + ')') : '-'],
           ['Latencia media global', c.latency.avgGlobalMs + ' ms'],
         ],
@@ -3401,8 +3550,8 @@ function renderLogsDashboardHtml(): string {
   }
 
   function fetchKpis() {
-    const win = el('kpi-window-select').value || 'v1.5.0';
-    const cmp = el('kpi-compare-select').value || 'v1.4.9';
+    const win = el('kpi-window-select').value || 'v1.5.1';
+    const cmp = el('kpi-compare-select').value || 'v1.5.0';
     state.lastKpiFetchMs = Date.now();
     fetch('/logs/kpis?window=' + encodeURIComponent(win) + '&compare=' + encodeURIComponent(cmp))
       .then((r) => r.ok ? r.json() : null)

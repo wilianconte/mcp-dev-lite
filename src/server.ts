@@ -1,8 +1,7 @@
 #!/usr/bin/env node
-import express, { type Request, type Response } from "express";
-import { randomUUID } from "node:crypto";
+import express, { type NextFunction, type Request, type Response } from "express";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import {
@@ -13,7 +12,7 @@ import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { tools } from "./tools.js";
 import { DevAgentOAuthProvider } from "./oauth.js";
 import { MCP_SERVER_VERSION, auditLogPath, auditToolCall } from "./audit.js";
-import { McpMonitor } from "./monitor.js";
+import { McpMonitor, renderMonitorLoginHtml } from "./monitor.js";
 
 const PORT = Number(process.env.PORT ?? 3000);
 const HOST = process.env.HOST ?? "0.0.0.0";
@@ -36,7 +35,7 @@ if (!AUTH_TOKEN) {
 const APPROVAL_PASSWORD = process.env.OAUTH_APPROVAL_PASSWORD ?? AUTH_TOKEN;
 const DATA_DIR = process.env.MCP_DATA_DIR
   ? path.resolve(process.env.MCP_DATA_DIR)
-  : path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "data");
+  : path.resolve(process.cwd(), "data");
 
 const monitor = new McpMonitor();
 void monitor.hydrateFromAuditFile(auditLogPath());
@@ -107,8 +106,8 @@ function buildServer(context: AuditRequestContext = {}): McpServer {
         } catch (err) {
           monitor.finishToolCall(txId, { error: err });
           await auditToolCall({ ...auditBase, error: err });
-          const message = err instanceof Error ? err.message : String(err);
-          return { content: [{ type: "text" as const, text: `ERRO: ${message}` }], isError: true };
+          const details = err instanceof Error ? err.stack ?? err.message : String(err);
+          return { content: [{ type: "text" as const, text: `ERRO: ${details}` }], isError: true };
         }
       },
     );
@@ -118,6 +117,7 @@ function buildServer(context: AuditRequestContext = {}): McpServer {
 }
 
 const app = express();
+app.disable("x-powered-by");
 
 // Por padrao, confia apenas em proxies locais (ex.: cloudflared em 127.0.0.1).
 // Isso permite que req.ip reflita X-Forwarded-For sem aceitar spoofing de clientes remotos diretos.
@@ -127,9 +127,10 @@ else if (trustProxyRaw.toLowerCase() === "true") app.set("trust proxy", true);
 else if (/^\d+$/.test(trustProxyRaw)) app.set("trust proxy", Number(trustProxyRaw));
 else app.set("trust proxy", trustProxyRaw);
 
-// Parser JSON enxuto para rotas publicas/OAuth; o parser de 50 MB do /mcp roda somente apos checkAuth.
+// Parser JSON enxuto para rotas publicas/OAuth; o parser do /mcp roda somente apos checkAuth.
 const smallJsonParser = express.json({ limit: "256kb" });
-const mcpJsonParser = express.json({ limit: "50mb" });
+const MCP_REQUEST_BODY_LIMIT = process.env.MCP_REQUEST_BODY_LIMIT?.trim() || "16mb";
+const mcpJsonParser = express.json({ limit: MCP_REQUEST_BODY_LIMIT });
 app.use((req, res, next) => {
   if (req.path === "/mcp") return next();
   return smallJsonParser(req, res, next);
@@ -147,7 +148,6 @@ app.use(
   }),
 );
 app.use(oauthProvider.approvalRouter());
-app.use(monitor.router());
 
 /**
  * Normaliza o header Authorization e extrai o token.
@@ -169,6 +169,13 @@ function mask(t: string): string {
   return `${t.slice(0, 4)}...${t.slice(-4)} (len ${t.length})`;
 }
 
+function matchesStaticToken(candidate: string): boolean {
+  if (!AUTH_TOKEN) return false;
+  const candidateBytes = Buffer.from(candidate);
+  const expectedBytes = Buffer.from(AUTH_TOKEN);
+  return candidateBytes.length === expectedBytes.length && timingSafeEqual(candidateBytes, expectedBytes);
+}
+
 /**
  * Autenticacao em todas as rotas MCP. Aceita duas credenciais:
  * - o token estatico MCP_AUTH_TOKEN (Copilot Studio);
@@ -183,7 +190,7 @@ async function checkAuth(req: Request, res: Response): Promise<AuthContext | nul
   const rawHeader = (req.headers.authorization as string | undefined) ?? "";
   const token = extractToken(rawHeader);
 
-  if (token === AUTH_TOKEN) return { type: "static", clientId: "static-token" };
+  if (matchesStaticToken(token)) return { type: "static", clientId: "static-token" };
   if (token) {
     try {
       const info = await oauthProvider.verifyAccessToken(token);
@@ -217,6 +224,147 @@ async function checkAuth(req: Request, res: Response): Promise<AuthContext | nul
   });
   return null;
 }
+
+interface MonitorCookieSession {
+  auth: AuthContext;
+  expiresAt: number;
+}
+
+const monitorCookieSessions = new Map<string, MonitorCookieSession>();
+const MONITOR_COOKIE_TTL_MS = 15 * 60 * 1000;
+const MONITOR_COOKIE_NAME = "mcp_monitor_session";
+const MONITOR_LOGIN_WINDOW_MS = 15 * 60 * 1000;
+const parsedMonitorLoginMaxAttempts = Number(process.env.MCP_MONITOR_LOGIN_MAX_ATTEMPTS ?? 10);
+const MONITOR_LOGIN_MAX_ATTEMPTS = Number.isInteger(parsedMonitorLoginMaxAttempts) && parsedMonitorLoginMaxAttempts > 0
+  ? parsedMonitorLoginMaxAttempts
+  : 10;
+const monitorLoginAttempts = new Map<string, { count: number; resetAt: number }>();
+
+function parseCookieHeader(header: string | undefined, name: string): string | undefined {
+  if (!header) return undefined;
+  for (const part of header.split(";")) {
+    const separator = part.indexOf("=");
+    if (separator === -1) continue;
+    if (part.slice(0, separator).trim() === name) {
+      try {
+        return decodeURIComponent(part.slice(separator + 1).trim());
+      } catch {
+        return undefined;
+      }
+    }
+  }
+  return undefined;
+}
+
+function issueMonitorCookie(req: Request, res: Response, auth: AuthContext): void {
+  const sessionId = randomUUID();
+  monitorCookieSessions.set(sessionId, { auth, expiresAt: Date.now() + MONITOR_COOKIE_TTL_MS });
+  while (monitorCookieSessions.size > 100) {
+    const oldest = monitorCookieSessions.keys().next().value;
+    if (oldest === undefined) break;
+    monitorCookieSessions.delete(oldest);
+  }
+  const secure = req.protocol === "https" ? "; Secure" : "";
+  res.setHeader(
+    "Set-Cookie",
+    `${MONITOR_COOKIE_NAME}=${encodeURIComponent(sessionId)}; Path=/logs; HttpOnly; SameSite=Strict; Max-Age=${Math.floor(MONITOR_COOKIE_TTL_MS / 1000)}${secure}`,
+  );
+}
+
+function clearMonitorCookie(req: Request, res: Response): void {
+  const secure = req.protocol === "https" ? "; Secure" : "";
+  res.setHeader(
+    "Set-Cookie",
+    `${MONITOR_COOKIE_NAME}=; Path=/logs; HttpOnly; SameSite=Strict; Max-Age=0${secure}`,
+  );
+}
+
+async function checkMonitorAuth(req: Request, res: Response): Promise<AuthContext | null> {
+  const rawHeader = (req.headers.authorization as string | undefined) ?? "";
+  if (rawHeader.trim()) {
+    const auth = await checkAuth(req, res);
+    if (auth) issueMonitorCookie(req, res, auth);
+    return auth;
+  }
+
+  const cookieId = parseCookieHeader(req.headers.cookie, MONITOR_COOKIE_NAME);
+  const cookieSession = cookieId ? monitorCookieSessions.get(cookieId) : undefined;
+  if (cookieSession && cookieSession.expiresAt > Date.now()) {
+    cookieSession.expiresAt = Date.now() + MONITOR_COOKIE_TTL_MS;
+    return cookieSession.auth;
+  }
+  if (cookieId) monitorCookieSessions.delete(cookieId);
+
+  return checkAuth(req, res);
+}
+
+async function requireMonitorAuth(req: Request, res: Response, next: NextFunction): Promise<void> {
+  const acceptsHtml = req.headers.accept?.includes("text/html") && !req.headers.accept?.includes("application/json");
+  const hasAuthorization = Boolean((req.headers.authorization as string | undefined)?.trim());
+  if (acceptsHtml && !hasAuthorization) {
+    const cookieId = parseCookieHeader(req.headers.cookie, MONITOR_COOKIE_NAME);
+    const cookieSession = cookieId ? monitorCookieSessions.get(cookieId) : undefined;
+    if (!cookieSession || cookieSession.expiresAt <= Date.now()) {
+      if (cookieId) {
+        monitorCookieSessions.delete(cookieId);
+        clearMonitorCookie(req, res);
+      }
+      res.redirect(302, "/logs/login");
+      return;
+    }
+  }
+  if (await checkMonitorAuth(req, res)) next();
+}
+
+const monitorFormParser = express.urlencoded({ extended: false, limit: "8kb" });
+app.get("/logs/login", (_req: Request, res: Response) => {
+  res.setHeader("Cache-Control", "no-store");
+  res.status(200).type("html").send(renderMonitorLoginHtml());
+});
+
+app.post("/logs/login", monitorFormParser, (req: Request, res: Response) => {
+  const ip = req.ip ?? "?";
+  const now = Date.now();
+  if (monitorLoginAttempts.size > 1_000) {
+    for (const [knownIp, knownAttempts] of monitorLoginAttempts) {
+      if (knownAttempts.resetAt <= now) monitorLoginAttempts.delete(knownIp);
+    }
+  }
+  const attempts = monitorLoginAttempts.get(ip);
+  if (attempts && attempts.resetAt <= now) monitorLoginAttempts.delete(ip);
+  const currentAttempts = monitorLoginAttempts.get(ip);
+  if (currentAttempts && currentAttempts.count >= MONITOR_LOGIN_MAX_ATTEMPTS) {
+    res.setHeader("Retry-After", String(Math.ceil((currentAttempts.resetAt - now) / 1000)));
+    res.status(429).type("html").send(renderMonitorLoginHtml("Muitas tentativas. Aguarde alguns minutos."));
+    return;
+  }
+  const token = typeof req.body?.token === "string" ? req.body.token.trim() : "";
+  if (!matchesStaticToken(token)) {
+    const nextAttempts = currentAttempts && currentAttempts.resetAt > now
+      ? currentAttempts
+      : { count: 0, resetAt: now + MONITOR_LOGIN_WINDOW_MS };
+    nextAttempts.count += 1;
+    monitorLoginAttempts.set(ip, nextAttempts);
+    res.setHeader("Cache-Control", "no-store");
+    res.status(401).type("html").send(renderMonitorLoginHtml("Token inválido. Tente novamente."));
+    return;
+  }
+  monitorLoginAttempts.delete(ip);
+  issueMonitorCookie(req, res, { type: "static", clientId: "static-token" });
+  res.redirect(303, "/logs");
+});
+
+app.post("/logs/logout", (req: Request, res: Response) => {
+  const cookieId = parseCookieHeader(req.headers.cookie, MONITOR_COOKIE_NAME);
+  if (cookieId) monitorCookieSessions.delete(cookieId);
+  clearMonitorCookie(req, res);
+  res.redirect(303, "/logs/login");
+});
+
+const monitorRouter = express.Router();
+monitorRouter.use("/logs", requireMonitorAuth);
+monitorRouter.use(monitor.router());
+app.use(monitorRouter);
 
 // Sessoes ativas, indexadas pelo header Mcp-Session-Id.
 const transports = new Map<string, StreamableHTTPServerTransport>();
@@ -266,7 +414,8 @@ app.post(
     (req as Request & { mcpAuth?: AuthContext }).mcpAuth = auth;
     mcpJsonParser(req, res, next);
   },
-  async (req: Request, res: Response) => {
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
     const auth = (req as Request & { mcpAuth: AuthContext }).mcpAuth;
     const sessionId = req.headers["mcp-session-id"] as string | undefined;
     let transport = sessionId ? transports.get(sessionId) : undefined;
@@ -350,11 +499,14 @@ app.post(
     }
 
     await transport.handleRequest(req, res, req.body);
+    } catch (err) {
+      next(err);
+    }
   },
 );
 
 // GET/DELETE para o canal de eventos SSE e encerramento de sessao.
-async function handleSession(req: Request, res: Response) {
+async function handleSessionRequest(req: Request, res: Response): Promise<void> {
   const auth = await checkAuth(req, res);
   if (!auth) return;
   const sessionId = req.headers["mcp-session-id"] as string | undefined;
@@ -391,13 +543,41 @@ async function handleSession(req: Request, res: Response) {
   await transport.handleRequest(req, res);
 }
 
+async function handleSession(req: Request, res: Response, next: NextFunction): Promise<void> {
+  try {
+    await handleSessionRequest(req, res);
+  } catch (err) {
+    next(err);
+  }
+}
+
 app.get("/mcp", handleSession);
 app.delete("/mcp", handleSession);
 
 // Health check simples (sem auth) para probes de infraestrutura.
 app.get("/health", (_req, res) =>
-  res.json({ status: "ok", version: MCP_SERVER_VERSION, tools: tools.map((t) => t.name) }),
+  res.json({ status: "ok", version: MCP_SERVER_VERSION }),
 );
+
+app.use((err: unknown, req: Request, res: Response, next: NextFunction) => {
+  if (res.headersSent) {
+    next(err);
+    return;
+  }
+  const error = err instanceof Error ? err : new Error(String(err));
+  const status = Number((err as { status?: unknown; statusCode?: unknown })?.statusCode ?? (err as { status?: unknown })?.status);
+  const responseStatus = Number.isInteger(status) && status >= 400 && status < 600 ? status : 500;
+  const authenticatedMcp = Boolean((req as Request & { mcpAuth?: AuthContext }).mcpAuth);
+  if (authenticatedMcp && req.path === "/mcp") {
+    res.status(responseStatus).json({
+      jsonrpc: "2.0",
+      error: { code: responseStatus === 400 ? -32700 : -32603, message: error.stack ?? error.message },
+      id: null,
+    });
+    return;
+  }
+  res.status(responseStatus).json({ error: "Erro interno do servidor." });
+});
 
 app.listen(PORT, HOST, () => {
   console.log(`MCP dev-agent ouvindo em http://${HOST}:${PORT}/mcp`);

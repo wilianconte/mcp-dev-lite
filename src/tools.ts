@@ -22,7 +22,9 @@ const DEFAULT_COMMAND_MAX_BUFFER_BYTES = 50 * 1024 * 1024;
 const MAX_STORED_JOBS = 500;
 const JOB_RETENTION_MS = 12 * 60 * 60 * 1000;
 const EXIT_PIPE_DRAIN_GRACE_MS = 250;
-const JOBS_STORE_DIR = path.join(os.tmpdir(), "mcp-dev-agent-jobs");
+const JOBS_STORE_DIR = path.resolve(
+  process.env.MCP_JOB_STORE_DIR?.trim() || path.join(os.tmpdir(), "mcp-dev-agent-jobs"),
+);
 const DEFAULT_SEARCH_IGNORE_DIRS = [
   "node_modules",
   ".git",
@@ -293,9 +295,13 @@ function buildCommandEnv(cwd: string): NodeJS.ProcessEnv {
   const now = Date.now();
   const basePath = process.env.PATH ?? "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
   const cacheKey = `${cwd}::${basePath}`;
+  const nonInteractiveDefaults: NodeJS.ProcessEnv = {
+    GH_PROMPT_DISABLED: process.env.GH_PROMPT_DISABLED ?? "1",
+    GIT_TERMINAL_PROMPT: process.env.GIT_TERMINAL_PROMPT ?? "0",
+  };
   const cached = commandEnvCache.get(cacheKey);
   if (cached && cached.expiresAt > now) {
-    return { ...process.env, PATH: cached.pathValue };
+    return applyCommandEnvMode({ ...process.env, ...nonInteractiveDefaults, PATH: cached.pathValue });
   }
 
   const prependDirs: string[] = [];
@@ -311,7 +317,20 @@ function buildCommandEnv(cwd: string): NodeJS.ProcessEnv {
   const parts = [...prependDirs, ...basePath.split(path.delimiter).filter(Boolean)];
   const deduped = Array.from(new Set(parts)).join(path.delimiter);
   commandEnvCache.set(cacheKey, { expiresAt: now + COMMAND_ENV_CACHE_TTL_MS, pathValue: deduped });
-  return { ...process.env, PATH: deduped };
+  return applyCommandEnvMode({ ...process.env, ...nonInteractiveDefaults, PATH: deduped });
+}
+
+const SENSITIVE_COMMAND_ENV_KEY = /(TOKEN|SECRET|PASSWORD|API[_-]?KEY|PRIVATE[_-]?KEY|CREDENTIAL|COOKIE|AUTH)/i;
+
+function applyCommandEnvMode(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const mode = process.env.MCP_COMMAND_ENV_MODE?.trim().toLowerCase() || "full";
+  if (mode === "full") return env;
+  if (mode !== "sanitized") {
+    throw new Error(`MCP_COMMAND_ENV_MODE invalido: ${mode}. Use full ou sanitized.`);
+  }
+  return Object.fromEntries(
+    Object.entries(env).filter(([key]) => !SENSITIVE_COMMAND_ENV_KEY.test(key)),
+  );
 }
 
 function executeCommand(command: string, cwd: string, timeoutMs: number): Promise<CommandExecution> {
@@ -464,7 +483,8 @@ function jobSnapshotPath(id: string): string {
 
 async function persistJobSnapshot(job: BackgroundJob): Promise<void> {
   try {
-    await fs.mkdir(JOBS_STORE_DIR, { recursive: true });
+    await fs.mkdir(JOBS_STORE_DIR, { recursive: true, mode: 0o700 });
+    await fs.chmod(JOBS_STORE_DIR, 0o700);
     const snapshot: PersistedJobSnapshot = {
       id: job.id,
       command: job.command,
@@ -487,8 +507,10 @@ async function persistJobSnapshot(job: BackgroundJob): Promise<void> {
     };
     const filePath = jobSnapshotPath(job.id);
     const tmpPath = `${filePath}.${process.pid}.${Date.now()}.tmp`;
-    await fs.writeFile(tmpPath, JSON.stringify(snapshot), "utf8");
+    await fs.writeFile(tmpPath, JSON.stringify(snapshot), { encoding: "utf8", mode: 0o600 });
+    await fs.chmod(tmpPath, 0o600);
     await fs.rename(tmpPath, filePath);
+    await fs.chmod(filePath, 0o600);
   } catch {
     // Falha de persistencia em disco nao deve interromper a execucao do job.
   }
@@ -986,6 +1008,29 @@ async function resolveJobWithTypoTolerance(
         activeJobsHint: "",
       };
     }
+
+    // Fallback v1.5.1: se nao ha nenhum job running nem unpolled, retorna o job concluido em memoria mais recente (<10 min)
+    // (ex.: quando o job ja concluiu dentro do wait_ms de start_command e o agente chama poll_command em seguida).
+    if (runningJobs.length === 0) {
+      const now = Date.now();
+      const recentCompletedInMemory = Array.from(backgroundJobs.values())
+        .filter(
+          (j) =>
+            j.status === "completed" &&
+            !j.killedByUser &&
+            !j.recoveredFromDisk &&
+            j.finishedAtMs !== undefined &&
+            now - j.finishedAtMs <= 10 * 60_000,
+        )
+        .sort((a, b) => (b.finishedAtMs ?? 0) - (a.finishedAtMs ?? 0));
+      if (recentCompletedInMemory.length >= 1) {
+        return {
+          job: recentCompletedInMemory[0],
+          autoCorrectedFrom: cleanId || "latest_completed",
+          activeJobsHint: "",
+        };
+      }
+    }
   }
 
   const recentJobs = Array.from(backgroundJobs.values())
@@ -1463,11 +1508,11 @@ function findNormalizedUniqueMatch(
       }
     }
   }
-  // Passo 4 (v1.4.8): normalizacao de contra-barras sobre-escapadas em scripts Bash/Markdown (ex.: "\\\\\n" -> "\\\n", "\\\\\"" -> "\\\"").
+  // Passo 4 (v1.4.8 / v1.5.1): normalizacao de contra-barras sobre-escapadas em scripts Bash/Markdown (ate 3 passadas para triplo escape).
   if (oldStr.includes("\\\\")) {
     let candidateOld = oldStr;
     let candidateNew = newStr;
-    for (let pass = 0; pass < 2; pass += 1) {
+    for (let pass = 0; pass < 3; pass += 1) {
       if (!candidateOld.includes("\\\\")) break;
       candidateOld = candidateOld.replace(/\\\\/g, "\\");
       if (candidateNew !== undefined) {
@@ -1651,6 +1696,174 @@ function findNormalizedUniqueMatch(
             index: origStart,
             length: origEnd - origStart,
           };
+        }
+      }
+    }
+  }
+  // Passo 7a (v1.5.1): tolerancia a reflow de quebras de linha / trailing comma do Prettier (1 linha <-> multiplas linhas).
+  if (trimmedTotal.length >= 25 && content.length <= 2_000_000) {
+    const rawParts = trimmedTotal.split(/(\s+|=>|[()[\]{},])/g).filter((p) => p.length > 0);
+    const nonWsTokens: Array<{ text: string; hadWsBefore: boolean }> = [];
+    let pendingWs = false;
+    for (const part of rawParts) {
+      if (/^\s+$/.test(part)) {
+        pendingWs = true;
+      } else {
+        nonWsTokens.push({ text: part, hadWsBefore: pendingWs });
+        pendingWs = false;
+      }
+    }
+    if (nonWsTokens.length >= 3 && nonWsTokens.length <= 120) {
+      const patternPieces: string[] = [];
+      for (let i = 0; i < nonWsTokens.length; i += 1) {
+        const curr = nonWsTokens[i];
+        if (i > 0) {
+          const prev = nonWsTokens[i - 1];
+          const isCloseDelim = curr.text === ")" || curr.text === "]" || curr.text === "}";
+          const isOpenOrSep =
+            prev.text === "(" ||
+            prev.text === "[" ||
+            prev.text === "{" ||
+            prev.text === "," ||
+            prev.text === "=>";
+          if (isCloseDelim && !isOpenOrSep) {
+            patternPieces.push(",?\\s*");
+          } else if (isOpenOrSep || isCloseDelim || curr.text === ",") {
+            patternPieces.push("\\s*");
+          } else if (curr.hadWsBefore) {
+            patternPieces.push("\\s+");
+          }
+        }
+        patternPieces.push(curr.text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+      }
+      const re = new RegExp(patternPieces.join(""), "g");
+      const first = re.exec(content);
+      if (first && !re.exec(content)) {
+        const leadingWs = oldStr.match(/^[ \t]+/)?.[0] ?? "";
+        if (
+          leadingWs.length > 0 &&
+          first.index >= leadingWs.length &&
+          content.slice(first.index - leadingWs.length, first.index) === leadingWs &&
+          (first.index - leadingWs.length === 0 || content[first.index - leadingWs.length - 1] === "\n")
+        ) {
+          return {
+            index: first.index - leadingWs.length,
+            length: first[0].length + leadingWs.length,
+          };
+        }
+        return { index: first.index, length: first[0].length };
+      }
+    }
+  }
+  // Passo 7b (v1.5.1): equivalencia de delimitador de string JS/Bash apos formatacao Prettier ('...\'...' <-> "...'...")
+  if (oldStr.length >= 15 && content.length <= 2_000_000 && (oldStr.includes("\\'") || oldStr.includes('\\"'))) {
+    let swappedOld = oldStr.replace(/'((?:[^'\\\n]|\\.)*)'/g, (full, inner: string) => {
+      if (inner.includes("\\'") && !inner.includes('"') && !inner.includes("${")) {
+        return `"${inner.replace(/\\'/g, "'")}"`;
+      }
+      return full;
+    });
+    if (swappedOld === oldStr && oldStr.includes('\\"')) {
+      swappedOld = oldStr.replace(/"((?:[^"\\\n]|\\.)*)"/g, (full, inner: string) => {
+        if (inner.includes('\\"') && !inner.includes("'")) {
+          return `'${inner.replace(/\\"/g, '"')}'`;
+        }
+        return full;
+      });
+    }
+    if (swappedOld !== oldStr) {
+      const swappedOcc = countOccurrences(content, swappedOld);
+      if (swappedOcc.count === 1) {
+        return { index: swappedOcc.firstIndex, length: swappedOld.length };
+      }
+    }
+  }
+  // Passo 7c (v1.5.1): ancoragem deterministica de linhas narrativas longas em YAML/Markdown (quando o prefixo longo e unico e apenas o sufixo/clausula final divergiu).
+  if (oldStr.length >= 60 && content.length <= 2_000_000) {
+    const rawOldLines = oldStr.split(/\r?\n/);
+    const fileLines = content.split("\n");
+    if (rawOldLines.length >= 2 && rawOldLines.length <= 10 && fileLines.length >= rawOldLines.length) {
+      const minNarrativePrefix = rawOldLines.length === 2 ? 60 : 40;
+      let matchedStartLine = -1;
+      let candidateWins = 0;
+      for (let start = 0; start <= fileLines.length - rawOldLines.length; start += 1) {
+        let exactMatches = 0;
+        let diffIdx = -1;
+        for (let k = 0; k < rawOldLines.length; k += 1) {
+          const fl = fileLines[start + k].replace(/\r$/, "");
+          if (fl === rawOldLines[k]) {
+            exactMatches += 1;
+          } else {
+            diffIdx = k;
+          }
+        }
+        if (exactMatches === rawOldLines.length - 1 && diffIdx !== -1) {
+          const oldDiff = rawOldLines[diffIdx];
+          const fileDiff = fileLines[start + diffIdx].replace(/\r$/, "");
+          const quotesMatch =
+            !oldDiff.trimEnd().endsWith('"') || fileDiff.trimEnd().endsWith('"');
+          if (
+            oldDiff.trim().length >= 45 &&
+            fileDiff.trim().length >= 45 &&
+            oldDiff.length >= minNarrativePrefix &&
+            fileDiff.startsWith(oldDiff.slice(0, minNarrativePrefix)) &&
+            quotesMatch
+          ) {
+            matchedStartLine = start;
+            candidateWins += 1;
+            if (candidateWins > 1) break;
+          }
+        }
+      }
+      if (candidateWins === 1 && matchedStartLine !== -1) {
+        let charIdx = 0;
+        for (let i = 0; i < matchedStartLine; i += 1) {
+          charIdx += fileLines[i].length + 1;
+        }
+        const matchedSlice = fileLines
+          .slice(matchedStartLine, matchedStartLine + rawOldLines.length)
+          .join("\n")
+          .replace(/\r$/, "");
+        return { index: charIdx, length: matchedSlice.length };
+      }
+    } else if (rawOldLines.length === 1 && oldStr.length >= 80) {
+      const isFullLineReplacement =
+        newStr === undefined ||
+        newStr.slice(0, 12) === oldStr.slice(0, 12) ||
+        (/^[ \t]*(?:[-*+]|\d+\.|[a-zA-Z0-9_]+:)\s+/.test(oldStr) &&
+          /^[ \t]*(?:[-*+]|\d+\.|[a-zA-Z0-9_]+:)\s+/.test(newStr));
+      if (isFullLineReplacement) {
+        let matchedLineIdx = -1;
+        let lineWins = 0;
+        for (let i = 0; i < fileLines.length; i += 1) {
+          const fl = fileLines[i].replace(/\r$/, "");
+          if (fl.length < 70 || !fl.startsWith(oldStr.slice(0, 60))) continue;
+          let prefixLen = 60;
+          const minLen = Math.min(oldStr.length, fl.length);
+          while (prefixLen < minLen && oldStr[prefixLen] === fl[prefixLen]) {
+            prefixLen += 1;
+          }
+          let suffixLen = 0;
+          while (
+            suffixLen < minLen - prefixLen &&
+            oldStr[oldStr.length - 1 - suffixLen] === fl[fl.length - 1 - suffixLen]
+          ) {
+            suffixLen += 1;
+          }
+          const maxLen = Math.max(oldStr.length, fl.length);
+          if (prefixLen + suffixLen >= Math.max(70, Math.floor(maxLen * 0.82))) {
+            matchedLineIdx = i;
+            lineWins += 1;
+            if (lineWins > 1) break;
+          }
+        }
+        if (lineWins === 1 && matchedLineIdx !== -1) {
+          let charIdx = 0;
+          for (let i = 0; i < matchedLineIdx; i += 1) {
+            charIdx += fileLines[i].length + 1;
+          }
+          const fl = fileLines[matchedLineIdx].replace(/\r$/, "");
+          return { index: charIdx, length: fl.length };
         }
       }
     }
@@ -1850,7 +2063,29 @@ function buildMissingOldStringHint(content: string, oldStr: string): string {
       longLineFocus = `\nFoco na coluna ${sliceStart + 1}..${sliceEnd} da linha ${matchIdx + 1}:\n  ...${targetLine.slice(sliceStart, sliceEnd)}...`;
     }
   }
-  return `\nTrecho similar encontrado proximo a linha ${matchIdx + 1}:\n${snippet}${longLineFocus}`;
+  let exactDivergenceHint = "";
+  const windowSlice = fileLines.slice(start, end);
+  for (const oldItem of indexedOldLines) {
+    if (oldItem.trimmed.length < 25) continue;
+    for (let wIdx = 0; wIdx < windowSlice.length; wIdx += 1) {
+      const flTrimmed = windowSlice[wIdx].trim();
+      if (flTrimmed === oldItem.trimmed || flTrimmed.length < 25) continue;
+      if (flTrimmed.slice(0, 20) === oldItem.trimmed.slice(0, 20)) {
+        let divCol = 20;
+        const minLen = Math.min(flTrimmed.length, oldItem.trimmed.length);
+        while (divCol < minLen && flTrimmed[divCol] === oldItem.trimmed[divCol]) {
+          divCol += 1;
+        }
+        const ctxStart = Math.max(0, divCol - 25);
+        const fileExcerpt = flTrimmed.slice(ctxStart, Math.min(flTrimmed.length, divCol + 65));
+        const oldExcerpt = oldItem.trimmed.slice(ctxStart, Math.min(oldItem.trimmed.length, divCol + 65));
+        exactDivergenceHint = `\nDivergencia exata na linha ${start + wIdx + 1} (coluna ${divCol + 1}):\n  arquivo   : ...${fileExcerpt}...\n  old_string: ...${oldExcerpt}...`;
+        break;
+      }
+    }
+    if (exactDivergenceHint) break;
+  }
+  return `\nTrecho similar encontrado proximo a linha ${matchIdx + 1}:\n${snippet}${longLineFocus}${exactDivergenceHint}`;
 }
 
 /** Divide um padrao de busca de arquivos por '|' (quando fora de chaves {}), permitindo alternancia estilo regex/glob. */
@@ -1898,6 +2133,8 @@ const STRUCTURAL_HINT_SUBDIRS = [
   "packages",
   "apps",
   "modules",
+  "docs",
+  "scripts",
   "criaelo",
   "criaelo/services",
   "criaelo/packages",
@@ -1993,6 +2230,32 @@ async function inspectMissingPathDetails(target: string): Promise<MissingPathDet
         const tokens = missingLower.split(/[-_.\s/]+/).filter((t) => t.length >= 2);
 
         const candidates: string[] = [];
+        const worktreesRoot = process.env.MCP_WORKTREES_ROOT || "/root/repos/work";
+        const reposRoot = path.dirname(worktreesRoot);
+        if (
+          target.startsWith(`${reposRoot}${path.sep}`) &&
+          !target.startsWith(`${worktreesRoot}${path.sep}`)
+        ) {
+          const relFromRepos = path.relative(reposRoot, target);
+          const repoSegs = relFromRepos.split(path.sep);
+          const repoName = repoSegs[0];
+          const repoSubPath = repoSegs.slice(1).join(path.sep);
+          if (repoName && repoSubPath) {
+            const workIdx = getCachedDirectoryIndex(worktreesRoot);
+            if (workIdx) {
+              const prefixLower = `${repoName.toLowerCase()}-`;
+              for (let i = workIdx.dirNames.length - 1; i >= 0; i -= 1) {
+                const wtName = workIdx.dirNames[i];
+                if (!wtName.toLowerCase().startsWith(prefixLower)) continue;
+                const wtCandidate = path.join(worktreesRoot, wtName, repoSubPath);
+                if (existsSync(wtCandidate)) {
+                  candidates.push(wtCandidate);
+                  if (candidates.length >= 2) break;
+                }
+              }
+            }
+          }
+        }
         for (const sub of STRUCTURAL_HINT_SUBDIRS) {
           const fullCandidate = path.join(parent, sub, relMissing);
           if (existsSync(fullCandidate)) {

@@ -13,6 +13,26 @@ const tool = (name) => {
 
 const textOf = (result) => result.content.find((item) => item.type === 'text')?.text ?? '';
 
+test('run_command pode remover credenciais do ambiente quando MCP_COMMAND_ENV_MODE=sanitized', async () => {
+  const previousMode = process.env.MCP_COMMAND_ENV_MODE;
+  const previousToken = process.env.MCP_AUTH_TOKEN;
+  const previousVisible = process.env.MCP_TEST_VISIBLE;
+  process.env.MCP_COMMAND_ENV_MODE = 'sanitized';
+  process.env.MCP_AUTH_TOKEN = 'nao-deve-vazar';
+  process.env.MCP_TEST_VISIBLE = 'visivel';
+  try {
+    const result = await tool('run_command').handler({ command: 'printf "%s|%s" "$MCP_AUTH_TOKEN" "$MCP_TEST_VISIBLE"' });
+    assert.equal(textOf(result).match(/stdout:\n([^\n]*)/)?.[1], '|visivel');
+  } finally {
+    if (previousMode === undefined) delete process.env.MCP_COMMAND_ENV_MODE;
+    else process.env.MCP_COMMAND_ENV_MODE = previousMode;
+    if (previousToken === undefined) delete process.env.MCP_AUTH_TOKEN;
+    else process.env.MCP_AUTH_TOKEN = previousToken;
+    if (previousVisible === undefined) delete process.env.MCP_TEST_VISIBLE;
+    else process.env.MCP_TEST_VISIBLE = previousVisible;
+  }
+});
+
 test('run_command preserva saida grande e permite paginacao posterior', async () => {
   const result = await tool('run_command').handler({
     command: `node -e "process.stdout.write('A'.repeat(31000) + 'TAIL_MARKER')"`,

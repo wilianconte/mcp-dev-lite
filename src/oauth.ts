@@ -1,5 +1,5 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
-import { mkdirSync, readFileSync } from "node:fs";
+import { chmodSync, copyFileSync, mkdirSync, readFileSync } from "node:fs";
 import path from "node:path";
 import express, { type Request, type Response, Router } from "express";
 import type {
@@ -32,6 +32,7 @@ interface StoredToken {
 
 /** Estado persistido em disco: clients registrados via DCR e tokens emitidos. */
 interface PersistedState {
+  tokenHashVersion: 1;
   clients: Record<string, OAuthClientInformationFull>;
   accessTokens: Record<string, StoredToken>;
   refreshTokens: Record<string, StoredToken>;
@@ -57,6 +58,68 @@ function nowSec(): number {
 
 function newToken(): string {
   return randomBytes(32).toString("hex");
+}
+
+function tokenStorageKey(token: string): string {
+  return createHash("sha256").update(token).digest("hex");
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function validateTokenMap(value: unknown, field: string, requireHash = false): Record<string, StoredToken> {
+  if (!isRecord(value)) throw new Error(`Estado OAuth invalido: ${field} deve ser um objeto.`);
+  const result: Record<string, StoredToken> = {};
+  for (const [key, raw] of Object.entries(value)) {
+    if (requireHash && !/^[a-f0-9]{64}$/.test(key)) {
+      throw new Error(`Estado OAuth invalido: chave de ${field} nao e um hash SHA-256.`);
+    }
+    if (!isRecord(raw) || typeof raw.clientId !== "string" || !Array.isArray(raw.scopes) ||
+        !raw.scopes.every((scope) => typeof scope === "string") ||
+        typeof raw.expiresAt !== "number" || !Number.isFinite(raw.expiresAt)) {
+      throw new Error(`Estado OAuth invalido: entrada de ${field} nao possui o formato esperado.`);
+    }
+    result[key] = {
+      clientId: raw.clientId,
+      scopes: raw.scopes,
+      expiresAt: raw.expiresAt,
+    };
+  }
+  return result;
+}
+
+function parsePersistedState(raw: unknown): { state: PersistedState; migrated: boolean } {
+  if (!isRecord(raw) || !isRecord(raw.clients)) {
+    throw new Error("Estado OAuth invalido: clients deve ser um objeto.");
+  }
+  const clients: Record<string, OAuthClientInformationFull> = {};
+  for (const [clientId, client] of Object.entries(raw.clients)) {
+    if (!isRecord(client) || client.client_id !== clientId || !Array.isArray(client.redirect_uris)) {
+      throw new Error(`Estado OAuth invalido: client ${clientId} nao possui o formato esperado.`);
+    }
+    clients[clientId] = client as unknown as OAuthClientInformationFull;
+  }
+  const hasHashVersion = raw.tokenHashVersion !== undefined;
+  const accessTokens = validateTokenMap(raw.accessTokens, "accessTokens", hasHashVersion);
+  const refreshTokens = validateTokenMap(raw.refreshTokens, "refreshTokens", hasHashVersion);
+  if (raw.tokenHashVersion === 1) {
+    return { state: { tokenHashVersion: 1, clients, accessTokens, refreshTokens }, migrated: false };
+  }
+  if (raw.tokenHashVersion !== undefined) {
+    throw new Error(`Estado OAuth invalido: tokenHashVersion ${String(raw.tokenHashVersion)} nao suportado.`);
+  }
+  const hashMap = (map: Record<string, StoredToken>): Record<string, StoredToken> =>
+    Object.fromEntries(Object.entries(map).map(([token, info]) => [tokenStorageKey(token), info]));
+  return {
+    state: {
+      tokenHashVersion: 1,
+      clients,
+      accessTokens: hashMap(accessTokens),
+      refreshTokens: hashMap(refreshTokens),
+    },
+    migrated: true,
+  };
 }
 
 /** Comparacao em tempo constante (via hash, para aceitar tamanhos diferentes). */
@@ -89,7 +152,7 @@ import type { McpMonitor } from "./monitor.js";
  * restarts; codigos de autorizacao e aprovacoes pendentes sao efemeros.
  */
 export class DevAgentOAuthProvider implements OAuthServerProvider {
-  private state: PersistedState = { clients: {}, accessTokens: {}, refreshTokens: {} };
+  private state: PersistedState = { tokenHashVersion: 1, clients: {}, accessTokens: {}, refreshTokens: {} };
   private readonly statePath: string;
   private readonly approvalPassword: string;
   private readonly monitor?: McpMonitor;
@@ -104,13 +167,30 @@ export class DevAgentOAuthProvider implements OAuthServerProvider {
     this.approvalPassword = approvalPassword;
     this.monitor = monitor;
     this.statePath = path.join(dataDir, "oauth-state.json");
-    mkdirSync(dataDir, { recursive: true });
+    mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+    chmodSync(dataDir, 0o700);
+    let migrated = false;
     try {
-      this.state = JSON.parse(readFileSync(this.statePath, "utf8")) as PersistedState;
-    } catch {
-      // Sem estado anterior (primeira execucao) ou arquivo corrompido: comeca vazio.
+      const rawText = readFileSync(this.statePath, "utf8");
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(rawText);
+      } catch (err) {
+        throw new Error(`Estado OAuth invalido: JSON nao pode ser interpretado (${String(err)}).`);
+      }
+      const normalized = parsePersistedState(parsed);
+      this.state = normalized.state;
+      migrated = normalized.migrated;
+      if (migrated) {
+        const backupPath = `${this.statePath}.bak.${Date.now()}`;
+        copyFileSync(this.statePath, backupPath);
+        chmodSync(backupPath, 0o600);
+      }
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") throw err;
     }
     this.pruneExpired();
+    if (migrated) void this.save().catch((err) => console.error(`[oauth] falha na migracao: ${String(err)}`));
   }
 
   /** Agenda persistencia assincrona coalescida para nao bloquear o event loop em chamadas concorrentes. */
@@ -118,18 +198,16 @@ export class DevAgentOAuthProvider implements OAuthServerProvider {
     if (this.saveScheduled) return this.saveChain;
     this.saveScheduled = true;
     this.saveChain = this.saveChain
+      .catch(() => undefined)
       .then(async () => {
-        this.saveScheduled = false;
         const payload = JSON.stringify(this.state);
         const tmp = `${this.statePath}.tmp`;
         await writeFile(tmp, payload, { encoding: "utf8", mode: 0o600 });
-        await chmod(tmp, 0o600).catch(() => undefined);
+        await chmod(tmp, 0o600);
         await rename(tmp, this.statePath);
       })
-      .catch((err) => {
+      .finally(() => {
         this.saveScheduled = false;
-        const message = err instanceof Error ? err.message : String(err);
-        console.error(`[oauth] falha ao persistir estado: ${message}`);
       });
     return this.saveChain;
   }
@@ -148,15 +226,22 @@ export class DevAgentOAuthProvider implements OAuthServerProvider {
     for (const [id, p] of this.pending) if (p.expiresAt <= now) this.pending.delete(id);
     for (const [code, c] of this.codes) if (c.expiresAt <= now) this.codes.delete(code);
     for (const [ip, att] of this.failedAttempts) if (att.resetAt <= now) this.failedAttempts.delete(ip);
-    if (stateDirty) void this.save();
+    if (stateDirty) void this.save().catch((err) => console.error(`[oauth] falha ao persistir expiracao: ${String(err)}`));
   }
 
   get clientsStore(): OAuthRegisteredClientsStore {
     return {
       getClient: (clientId: string) => this.state.clients[clientId],
       registerClient: async (client: OAuthClientInformationFull) => {
+        const previous = this.state.clients[client.client_id];
         this.state.clients[client.client_id] = client;
-        await this.save();
+        try {
+          await this.save();
+        } catch (err) {
+          if (previous) this.state.clients[client.client_id] = previous;
+          else delete this.state.clients[client.client_id];
+          throw err;
+        }
         console.log(
           `[oauth] client registrado: ${client.client_id} (${client.client_name ?? "sem nome"}) | ` +
             `redirect_uris: ${client.redirect_uris.join(", ")}`,
@@ -329,7 +414,12 @@ export class DevAgentOAuthProvider implements OAuthServerProvider {
       throw new InvalidGrantError("redirect_uri diferente do usado na autorizacao.");
     }
     this.codes.delete(authorizationCode); // uso unico
-    return this.issueTokens(client.client_id, code.scopes, "authorization_code");
+    try {
+      return await this.issueTokens(client.client_id, code.scopes, "authorization_code");
+    } catch (err) {
+      this.codes.set(authorizationCode, code);
+      throw err;
+    }
   }
 
   async exchangeRefreshToken(
@@ -338,13 +428,19 @@ export class DevAgentOAuthProvider implements OAuthServerProvider {
     scopes?: string[],
   ): Promise<OAuthTokens> {
     this.pruneExpired();
-    const stored = this.state.refreshTokens[refreshToken];
+    const storageKey = tokenStorageKey(refreshToken);
+    const stored = this.state.refreshTokens[storageKey];
     if (!stored || stored.clientId !== client.client_id || stored.expiresAt <= nowSec()) {
       throw new InvalidGrantError("Refresh token invalido ou expirado.");
     }
     // Rotacao: o refresh token antigo deixa de valer.
-    delete this.state.refreshTokens[refreshToken];
-    return this.issueTokens(client.client_id, scopes?.length ? scopes : stored.scopes, "refresh_token");
+    delete this.state.refreshTokens[storageKey];
+    try {
+      return await this.issueTokens(client.client_id, scopes?.length ? scopes : stored.scopes, "refresh_token");
+    } catch (err) {
+      this.state.refreshTokens[storageKey] = stored;
+      throw err;
+    }
   }
 
   private async issueTokens(
@@ -355,9 +451,17 @@ export class DevAgentOAuthProvider implements OAuthServerProvider {
     const accessToken = newToken();
     const refreshToken = newToken();
     const now = nowSec();
-    this.state.accessTokens[accessToken] = { clientId, scopes, expiresAt: now + ACCESS_TOKEN_TTL };
-    this.state.refreshTokens[refreshToken] = { clientId, scopes, expiresAt: now + REFRESH_TOKEN_TTL };
-    await this.save();
+    const accessKey = tokenStorageKey(accessToken);
+    const refreshKey = tokenStorageKey(refreshToken);
+    this.state.accessTokens[accessKey] = { clientId, scopes, expiresAt: now + ACCESS_TOKEN_TTL };
+    this.state.refreshTokens[refreshKey] = { clientId, scopes, expiresAt: now + REFRESH_TOKEN_TTL };
+    try {
+      await this.save();
+    } catch (err) {
+      delete this.state.accessTokens[accessKey];
+      delete this.state.refreshTokens[refreshKey];
+      throw err;
+    }
     this.monitor?.recordEvent({
       category: "oauth",
       event: grantType === "refresh_token" ? "oauth.refresh" : "oauth.token",
@@ -374,7 +478,7 @@ export class DevAgentOAuthProvider implements OAuthServerProvider {
   }
 
   async verifyAccessToken(token: string): Promise<AuthInfo> {
-    const stored = this.state.accessTokens[token];
+    const stored = this.state.accessTokens[tokenStorageKey(token)];
     if (!stored || stored.expiresAt <= nowSec()) {
       throw new InvalidTokenError("Access token invalido ou expirado.");
     }
@@ -391,10 +495,20 @@ export class DevAgentOAuthProvider implements OAuthServerProvider {
     request: OAuthTokenRevocationRequest,
   ): Promise<void> {
     const { token } = request;
+    const storageKey = tokenStorageKey(token);
+    const removed: Array<[Record<string, StoredToken>, StoredToken]> = [];
     for (const map of [this.state.accessTokens, this.state.refreshTokens]) {
-      if (map[token]?.clientId === client.client_id) delete map[token];
+      if (map[storageKey]?.clientId === client.client_id) {
+        removed.push([map, map[storageKey]]);
+        delete map[storageKey];
+      }
     }
-    await this.save();
+    try {
+      await this.save();
+    } catch (err) {
+      for (const [map, value] of removed) map[storageKey] = value;
+      throw err;
+    }
     this.monitor?.recordEvent({
       category: "oauth",
       event: "oauth.revoke",

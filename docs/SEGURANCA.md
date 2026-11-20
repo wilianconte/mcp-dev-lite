@@ -53,7 +53,7 @@ O provider implementa:
 
 ### Proteção do estado local
 
-`data/oauth-state.json` é ignorado pelo Git. O writer usa arquivo temporário, `chmod 0600` e rename para persistência atômica.
+`data/oauth-state.json` é ignorado pelo Git. O writer usa arquivo temporário, `chmod 0600` e rename para persistência atômica. Tokens de acesso e refresh ficam indexados por hash SHA-256. Estados antigos são migrados com backup `.bak.<timestamp>`. JSON inválido ou esquema incompatível interrompe a inicialização para evitar operar com estado silenciosamente perdido.
 
 ### Saídas grandes
 
@@ -81,12 +81,12 @@ O armazenamento temporário usa:
 | Alta | Credencial comprometida dá acesso amplo à VM | Inerente ao desenho | VM dedicada, usuário de baixo privilégio, rotação e TLS. |
 | Alta | Falta de rastreabilidade de `tools/call` | Mitigado | Auditoria estruturada com sessão/client, duração, resultado resumido e redaction. Centralizar/reter logs conforme criticidade. |
 | Média | Shell e filesystem não têm sandbox/allowlist | Decisão intencional | Isolar a VM e limitar o usuário do SO em vez de confiar no processo. |
-| Média | Tokens OAuth ficam persistidos em formato utilizável pelo processo | Protegidos por permissão de arquivo | Tratar `data/oauth-state.json` como segredo; avaliar store dedicado/criptografia conforme ambiente. |
+| Média | Estado OAuth local contém hashes de tokens e dados de clients | Protegido por diretório `0700`, arquivos `0600` e escrita atômica | Tratar `data/oauth-state.json` como segredo operacional e manter backups de migração sob a mesma proteção. |
 | Média | Rate limit da aprovação depende de `req.ip` | Mitigado para túnel local | `trust proxy=loopback` por padrão e teste de integração; revisar `MCP_TRUST_PROXY` em topologias diferentes. |
 | Média | Não há rate limit global no `/mcp`/OAuth | Não implementado | Aplicar limite no proxy/Cloudflare e, se necessário, também na aplicação. |
-| Média | Body JSON global aceita até 50 MiB | Configurado no Express | Avaliar limite menor por endpoint para reduzir superfície de abuso. |
+| Média | Body JSON do `/mcp` pode consumir memória | Mitigado | Limite padrão de `16mb` após autenticação, configurável por `MCP_REQUEST_BODY_LIMIT`; manter o menor valor compatível com os clientes. |
 | Média | Sessões MCP e rate limit estão em memória | Processo único | Não escalar horizontalmente sem backend compartilhado/afinidade. |
-| Baixa | `/health` é público e revela nomes das ferramentas | Intencional | Aceitável em muitos ambientes; restringir no proxy se a exposição não for desejada. |
+| Baixa | `/health` é público | Intencional | Resposta mínima com status e versão, sem catálogo de ferramentas. |
 
 ## Observação sobre proxy e `req.ip`
 
@@ -131,10 +131,11 @@ Nunca grave esses valores em README, issue, prompt compartilhado ou log de audit
 - mantenha senha OAuth diferente do token estático;
 - rotacione credenciais periodicamente e após suspeita de exposição;
 - restrinja permissão de `.env` e do estado OAuth.
+- o login web do monitor valida `MCP_AUTH_TOKEN` no servidor e mantém apenas um cookie de sessão temporário no navegador;
 
 ### Observabilidade
 
-Cada execução de ferramenta (`tools/call` validado) gera um evento estruturado `mcp.tool_call` com timestamp, sessão, request, client ID quando disponível, IP, duração, argumentos sanitizados e resumo de resultado/erro. Por padrão o evento vai para stderr/journald; `MCP_AUDIT_LOG_PATH` habilita JSONL em arquivo.
+Cada execução de ferramenta (`tools/call` validado) gera um evento estruturado `mcp.tool_call` com timestamp, sessão, request, client ID quando disponível, IP, duração, argumentos sanitizados e resumo de resultado/erro. Por padrão o evento vai para stderr/journald e `data/audit.jsonl`; `MCP_AUDIT_LOG_PATH` permite escolher outro arquivo ou desativar a cópia em arquivo com `false`.
 
 A sanitização mascara chaves como `token`, `password`, `secret`, `authorization` e padrões comuns embutidos em strings. Conteúdo integral de arquivos, stdout e imagens não é duplicado na auditoria.
 

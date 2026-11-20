@@ -33,10 +33,11 @@ mcp-dev-agent  (Express + Streamable HTTP, porta 3000)
 - **Transporte:** Streamable HTTP (endpoint único `POST/GET/DELETE /mcp`), que é o modo que o Copilot Studio consome MCP.
 - **Auth (duas formas, ambas aceitas no `/mcp`):**
   - **Bearer token estático** via header `Authorization` (variável `MCP_AUTH_TOKEN`) — usado pelo Copilot Studio.
-  - **OAuth 2.1** conforme a spec de autorização do MCP (Dynamic Client Registration, authorization code + PKCE, refresh token) — exigido pelo ChatGPT. Endpoints: `/.well-known/oauth-authorization-server`, `/.well-known/oauth-protected-resource/mcp`, `/authorize`, `/token`, `/register`, `/revoke`. A aprovação pede a senha `OAUTH_APPROVAL_PASSWORD` (fallback: `MCP_AUTH_TOKEN`). Clients e tokens ficam em `data/oauth-state.json` (fora do versionamento, `chmod 600`); implementação em `src/oauth.ts`.
+  - **OAuth 2.1** conforme a spec de autorização do MCP (Dynamic Client Registration, authorization code + PKCE, refresh token) — exigido pelo ChatGPT. Endpoints: `/.well-known/oauth-authorization-server`, `/.well-known/oauth-protected-resource/mcp`, `/authorize`, `/token`, `/register`, `/revoke`. A aprovação pede a senha `OAUTH_APPROVAL_PASSWORD` (fallback: `MCP_AUTH_TOKEN`). Clients e hashes de tokens ficam em `data/oauth-state.json` (fora do versionamento, diretório `0700`, arquivo `0600`); estados legados são migrados com backup; implementação em `src/oauth.ts`.
 - **Escopo de arquivos:** sem restrição de path — o agente opera em qualquer caminho permitido ao usuário Linux do serviço (decisão de projeto). Resolve `~` e caminhos relativos.
 - **Auditoria, Cache Zero-Stale e Monitoramento em Tempo Real (`/logs`):** cada execução de ferramenta (`tools/call` validado) gera evento JSON estruturado com sessão/client, duração, argumentos sanitizados e resumo do resultado. O painel `/logs` exibe conexões ativas, transações em tempo real via SSE (`/logs/stream`), alertas de inatividade e aba de KPI's qualitativos com comparativo histórico entre versões. O servidor conta com 3 módulos internos de cache *zero-stale* (índice de diretórios/worktrees validado por `statSync().mtimeMs`, cache LRU de paginação de leitura validado por `(mtimeMs, size)` + invalidação imediata em escritas, e cache de agregação de janelas de KPIs por `kpiMutationSeq`).
 - **Proxy:** `trust proxy=loopback` por padrão, adequado ao `cloudflared` local; outras topologias podem ajustar `MCP_TRUST_PROXY`.
+- **Painel web:** abra `/logs` no navegador. Sem sessão, o servidor redireciona para `/logs/login`, que valida o mesmo `MCP_AUTH_TOKEN` no servidor e cria um cookie administrativo temporário.
 
 ## Ferramentas expostas (17 ferramentas)
 
@@ -92,7 +93,7 @@ npm start
 
 Desenvolvimento com reload: `npm run dev` (também precisa de `MCP_AUTH_TOKEN`). Testes locais: `npm test`.
 
-Health check (sem auth): `GET /health` → `{ "status": "ok", "tools": [...] }`.
+Health check (sem auth): `GET /health` → `{ "status": "ok", "version": "..." }`.
 
 ### Teste rápido do handshake
 
@@ -124,7 +125,7 @@ O Copilot Studio consome MCP através de uma **tool/custom connector** apontando
 2. **Server URL:** a URL HTTPS pública que aponta para `/mcp` (ex.: `https://seu-host/mcp`).
 3. **Autenticação:** tipo **API Key** / cabeçalho, com header `Authorization` e valor `Bearer <seu MCP_AUTH_TOKEN>`. Guarde o token no cofre/variável de ambiente do connector, nunca no prompt.
 4. Salve e **publique** o connector; adicione a tool ao agente.
-5. As 16 ferramentas aparecem para o agente, que passa a decidir sozinho quando chamar `find_files`, `search_code`, `read_files`, `multi_edit_file`, `run_command`, `start_command`, etc.
+5. As 17 ferramentas aparecem para o agente, que passa a decidir sozinho quando chamar `find_files`, `search_code`, `read_files`, `multi_edit_file`, `run_command`, `start_command`, etc.
 
 > Observação: o suporte a MCP no Copilot Studio evolui rápido. Se a UI não oferecer MCP nativo na sua região/licença, crie um **custom connector** com uma spec OpenAPI que descreva o endpoint `/mcp` (Streamable HTTP) e o header `Authorization`.
 
@@ -147,4 +148,4 @@ Este servidor **executa comandos arbitrários** na VM. Consequências:
 - Rode o processo com um **usuário de baixo privilégio** dedicado ao desenvolvimento, não como `root`.
 - Prefira uma **VM descartável/isolada** por projeto; não aponte para máquinas com dados sensíveis de outros sistemas.
 - Sempre atrás de **TLS**; nunca exponha a porta HTTP crua na internet.
-- A auditoria de `tools/call` já é habilitada por padrão em `stderr`/journald; defina retenção adequada e use `MCP_AUDIT_LOG_PATH` apenas quando precisar de JSONL em arquivo.
+- A auditoria de `tools/call` já é habilitada por padrão em `stderr`/journald e `data/audit.jsonl`; defina retenção adequada ou use `MCP_AUDIT_LOG_PATH` para escolher outro arquivo.

@@ -1,15 +1,15 @@
 # Avaliação técnica
 
-**Data da avaliação:** 23 de agosto de 2026
+**Data da avaliação:** 20 de novembro de 2026
 
-**Versão avaliada:** `1.2.0`
+**Versão avaliada:** `1.5.1`
 **Escopo:** código-fonte, testes, autenticação, operação, deploy e documentação do `mcp-dev-agent` no estado atual do diretório de trabalho.
 
 ## Resumo executivo
 
 A aplicação está pequena, coesa e tecnicamente consistente para o objetivo de fornecer capacidades de desenvolvimento por MCP. O código compila em TypeScript estrito, a suíte automatizada passa e o servidor possui cobertura de integração para os principais fluxos de autenticação e sessão.
 
-A versão `1.2.0` adiciona os controles que eram a principal lacuna da avaliação anterior: auditoria estruturada de `tools/call`, validação do comportamento de IP atrás de proxy local e teste end-to-end de MCP/OAuth.
+A versão `1.5.1` adiciona os controles que eram a principal lacuna da avaliação anterior: auditoria estruturada de `tools/call`, validação do comportamento de IP atrás de proxy local e teste end-to-end de MCP/OAuth.
 
 O maior risco continua sendo inerente ao produto: uma credencial válida permite executar shell e acessar qualquer caminho permitido ao usuário Linux do serviço. Por isso, isolamento da VM, credenciais e proteção de perímetro continuam sendo controles essenciais.
 
@@ -17,7 +17,7 @@ O maior risco continua sendo inerente ao produto: uma credencial válida permite
 
 ```text
 npm run typecheck  -> aprovado
-npm test           -> 7/7 testes aprovados
+npm test           -> 31/31 testes aprovados
 npm audit --omit=dev --audit-level=moderate -> 0 vulnerabilidades conhecidas na última verificação
 ```
 
@@ -35,22 +35,29 @@ A suíte cobre atualmente:
 10. leitura de imagem MCP nativa;
 11. paginação de diretório.
 
-Os itens acima estão distribuídos em 7 casos de teste automatizados.
+Os itens acima estão distribuídos em 31 casos de teste automatizados.
 
 ## Capacidades atuais
 
-A versão `1.2.0` expõe 10 ferramentas:
+A versão `1.5.1` expõe 17 ferramentas:
 
-1. `run_command`
-2. `read_command_output`
-3. `read_file`
-4. `read_image`
-5. `write_file`
-6. `edit_file`
-7. `list_directory`
-8. `move_file`
-9. `make_directory`
-10. `delete_path`
+1. `stat_path`
+2. `find_files`
+3. `search_code`
+4. `read_file`
+5. `read_files`
+6. `list_directory`
+7. `read_image`
+8. `edit_file`
+9. `multi_edit_file`
+10. `write_file`
+11. `move_file`
+12. `make_directory`
+13. `delete_path`
+14. `run_command`
+15. `read_command_output`
+16. `start_command`
+17. `poll_command`
 
 ## Melhorias implementadas nesta evolução
 
@@ -72,7 +79,7 @@ A auditoria não grava o conteúdo integral retornado pelas tools. Ela registra 
 
 Campos sensíveis por nome são substituídos por `[REDACTED]`. Strings também passam por redaction de padrões comuns como `Bearer`, `token=`, `password=` e `api_key=`. Valores muito grandes são truncados.
 
-Por padrão a linha JSON é enviada para `stderr`, o que integra naturalmente com `journald`. Opcionalmente, `MCP_AUDIT_LOG_PATH` grava o mesmo evento em arquivo JSONL.
+Por padrão a linha JSON é enviada para `stderr` e gravada em `data/audit.jsonl`, o que integra naturalmente com `journald`. `MCP_AUDIT_LOG_PATH` permite escolher outro arquivo ou desativar a gravação com `false`. A rotação mantém `audit.jsonl` e `audit.jsonl.1` e serializa escritas concorrentes.
 
 ### Proxy e `req.ip`
 
@@ -132,7 +139,7 @@ Recomendado:
 
 #### Rate limiting de perímetro
 
-Os endpoints OAuth do SDK possuem limites próprios e a aprovação possui limite adicional por IP, mas `/mcp` continua sem limite global de aplicação.
+Os endpoints OAuth do SDK possuem limites próprios e a aprovação possui limite adicional por IP. O `POST /mcp` aplica limite padrão de `16mb` após autenticação, configurável com `MCP_REQUEST_BODY_LIMIT`.
 
 A recomendação principal é rate limiting/WAF no Cloudflare ou reverse proxy, pois essa camada pode bloquear abuso antes de consumir recursos da VM.
 
@@ -160,7 +167,7 @@ A versão ainda aparece em `package.json` e no `serverInfo` de `src/server.ts`. 
 
 #### Auditoria em arquivo
 
-Quando `MCP_AUDIT_LOG_PATH` é usado, a rotação deve ser responsabilidade do sistema operacional/logrotate ou de outro coletor. `journald` continua sendo a opção preferida para produção simples.
+O servidor já limita e rotaciona o arquivo local para `audit.jsonl.1`. Em produção, defina retenção e coleta no journald, logrotate ou outro coletor conforme a política operacional. `MCP_AUDIT_LOG_PATH=false` desativa a cópia em arquivo quando apenas stderr/journald for necessário.
 
 #### Estado local
 
@@ -172,11 +179,11 @@ OAuth e sessões continuam desenhados para instância única. Escala horizontal 
 |---|---|---|
 | Estrutura de código | Bom | Módulos pequenos e responsabilidades claras. |
 | Tipagem/build | Bom | TypeScript estrito e build verde. |
-| Ferramentas MCP | Bom | 10 ferramentas, paginação e multimodalidade. |
+| Ferramentas MCP | Bom | 17 ferramentas, paginação e multimodalidade. |
 | Testes de tools | Bom | Cobertura dos riscos recentes. |
 | Testes de integração | Bom para o porte atual | MCP, Bearer, OAuth, proxy e auditoria cobertos. |
 | Autenticação | Bom | Bearer estático + OAuth com PKCE/refresh/revogação. |
-| Auditoria | Bom | JSON estruturado com redaction; arquivo opcional. |
+| Auditoria | Bom | JSON estruturado com redaction, arquivo padrão, rotação e escritas serializadas. |
 | Segurança de execução | Dependente do ambiente | Shell/filesystem amplos por desenho. |
 | Deploy | Documentado | Cloudflare Tunnel + systemd. |
 | Escalabilidade horizontal | Não projetada | Estado local; manter instância única. |
@@ -184,4 +191,4 @@ OAuth e sessões continuam desenhados para instância única. Escala horizontal 
 
 ## Conclusão
 
-A versão `1.2.0` resolve as principais lacunas de rastreabilidade e cobertura de integração identificadas anteriormente. Para o uso pretendido em uma VM de desenvolvimento dedicada, a base está madura o suficiente para evoluir agora principalmente em **capacidade funcional multimodal**, sem abandonar o hardening operacional no perímetro.
+A versão `1.5.1` resolve as principais lacunas de rastreabilidade e cobertura de integração identificadas anteriormente. Para o uso pretendido em uma VM de desenvolvimento dedicada, a base está madura o suficiente para evoluir agora principalmente em **capacidade funcional multimodal**, sem abandonar o hardening operacional no perímetro.

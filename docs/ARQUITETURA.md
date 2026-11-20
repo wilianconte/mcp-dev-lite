@@ -20,7 +20,7 @@ Cloudflare Tunnel / reverse proxy
 Express (src/server.ts)
   |-- endpoints OAuth
   |-- /mcp (Streamable HTTP)
-  |-- /logs, /logs/api, /logs/stream (src/monitor.ts)
+  |-- /logs/login, /logs, /logs/api, /logs/stream (src/server.ts + src/monitor.ts)
   |-- /health
   |
   +--> DevAgentOAuthProvider (src/oauth.ts)
@@ -48,7 +48,7 @@ Responsável por:
 - autenticação do endpoint `/mcp`;
 - criação e gerenciamento das sessões Streamable HTTP;
 - registro das ferramentas MCP e instruções (`instructions`) de orientação ao modelo;
-- rotas de monitoramento em tempo real (`/logs`, `/logs/login`, `/logs/logout`, `/logs/api`, `/logs/stream`);
+- login server-side em `/logs/login` com cookie administrativo temporário e rotas de monitoramento autenticadas (`/logs`, `/logs/api`, `/logs/kpis`, `/logs/stream`);
 - endpoint `/health`.
 
 Cada sessão MCP recebe uma instância de `McpServer`. Os transportes ativos são indexados pelo header `Mcp-Session-Id` em um `Map` em memória.
@@ -92,7 +92,7 @@ Os grupos principais são:
 
 ### `src/monitor.ts`
 
-Mantém o rastreamento em tempo real das sessões MCP, transações (`tools/call`), alertas de inatividade e motor de KPI's qualitativos (`/logs/kpis`), hidratando o histórico inicial a partir da cauda (últimos 25 MiB, incluindo `audit.jsonl.1` rotacionado) do arquivo JSONL de auditoria (`data/audit.jsonl`) e transmitindo atualizações ao vivo via Server-Sent Events (`/logs/stream`) para o painel web em `/logs`. Inclui o `KpiWindowComputationCache`, que memoriza as métricas computadas por janela (`v1.4.3`..`v1.5.0`) indexadas pelo contador monotônico `kpiMutationSeq`.
+Mantém o rastreamento em tempo real das sessões MCP, transações (`tools/call`), alertas de inatividade e motor de KPI's qualitativos (`/logs/kpis`), hidratando o histórico inicial a partir da cauda (últimos 25 MiB, incluindo `audit.jsonl.1` rotacionado) do arquivo JSONL de auditoria (`data/audit.jsonl`) e transmitindo atualizações ao vivo via Server-Sent Events (`/logs/stream`) para o painel web em `/logs`. O snapshot informa `history.hydrationStatus` e `hydratedAuditEntries`, e os eventos distinguem sucesso, erro de ferramenta, saída de comando não zero, timeout, limite de saída e cancelamento. Inclui o `KpiWindowComputationCache`, que memoriza as métricas computadas por janela (`v1.4.3`..`v1.5.1`) indexadas pelo contador monotônico `kpiMutationSeq`.
 
 ### `src/output-store.ts`
 
@@ -197,7 +197,7 @@ Esse fluxo evita transportar base64 como texto de shell e preserva a semântica 
 | Autorizações pendentes | memória | Não |
 | Sessões MCP | memória | Não |
 | Saídas grandes | diretório temporário | Pode sobreviver ao processo, mas expira por TTL |
-| Auditoria | stderr/journald e opcionalmente `MCP_AUDIT_LOG_PATH` | Conforme retenção do coletor/arquivo |
+| Auditoria | `data/audit.jsonl` e stderr/journald por padrão, com `MCP_AUDIT_LOG_PATH` opcional | Conforme retenção do coletor/arquivo |
 
 ## Limites arquiteturais atuais
 

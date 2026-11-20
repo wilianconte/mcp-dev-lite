@@ -25,8 +25,8 @@ Passo a passo completo em [`DEPLOY-CLOUDFLARE.md`](./DEPLOY-CLOUDFLARE.md).
 
 ## 3. Recomendo adicionar antes de produção
 
-### 3.1 Log de auditoria — implementado na `1.2.0`
-Cada execução de ferramenta (`tools/call` validado) agora gera evento JSON estruturado com sessão/client, duração, argumentos sanitizados e resumo do resultado. O padrão é stderr/journald; `MCP_AUDIT_LOG_PATH` habilita arquivo JSONL opcional.
+### 3.1 Log de auditoria — implementado na `1.5.1`
+Cada execução de ferramenta (`tools/call` validado) agora gera evento JSON estruturado com sessão/client, duração, argumentos sanitizados e resumo do resultado. O padrão é `data/audit.jsonl`, com envio simultâneo para stderr/journald. A escrita e a rotação são serializadas por arquivo.
 
 ### 3.2 Spec OpenAPI para custom connector (prioridade média)
 Se a licença/região do Copilot Studio não oferecer MCP nativo, é necessário um **custom connector** com spec OpenAPI descrevendo o endpoint `/mcp` (Streamable HTTP) e o header `Authorization`. Manter a spec versionada no repo evita retrabalho na hora de publicar.

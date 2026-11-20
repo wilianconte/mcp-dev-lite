@@ -1,6 +1,6 @@
 # Ferramentas MCP e Guia de Orientação de Uso
 
-A versão `1.5.0` expõe **17 ferramentas**. O catálogo é definido em `src/tools.ts`, registrado dinamicamente pelo servidor em `src/server.ts` e acompanhado por instruções de protocolo (`instructions`) enviadas automaticamente no handshake `initialize`.
+A versão `1.5.1` expõe **17 ferramentas**. O catálogo é definido em `src/tools.ts`, registrado dinamicamente pelo servidor em `src/server.ts` e acompanhado por instruções de protocolo (`instructions`) enviadas automaticamente no handshake `initialize`.
 
 ## Visão geral
 
@@ -335,5 +335,5 @@ O painel em tempo real em `/logs` possui 4 abas:
 3. **Alertas**: watchdog configurável de inatividade com alerta sonoro via Web Audio API e histórico de incidentes.
 4. **KPI's (`#kpis` / `GET /logs/kpis`)**:
    - **Termômetro de Massa Crítica**: acompanha os 4 pilares para reavaliação estatística (`>= 1.500` chamadas totais, `>= 200` edições `edit_file` + `multi_edit_file`, `>= 80` chamadas `poll_command`, ou critério híbrido de `7 dias` com mínimo de `1.000` chamadas), classificando em `COLETA_INICIAL`, `PRELIMINAR` (`>= 500` calls, `>= 75` edições, `>= 30` polls) ou `PRONTA`.
-   - **6 Scorecards Qualitativos com comparativo de baseline (`v1.5.0` vs `v1.4.9`)**: Confiabilidade Global (`>= 99%`), Qualidade de Edição e Auto-Recuperação sem `read_file` (*Self-Heal*), Eficiência de Jobs e Polling (`wait_ms >= 60s`), Higiene de Ambiente e Ferramentas Nativas (`NVM manual = 0`), Economia de Contexto e Batching, e Latência Nativa Local (`p50`/`p95` + telemetria de hits dos Caches Zero-Stale).
+   - **6 Scorecards Qualitativos com comparativo de baseline (`v1.5.1` vs `v1.5.0`)**: Confiabilidade Global (`>= 99%`), Qualidade de Edição e Auto-Recuperação sem `read_file` (*Self-Heal*), Eficiência de Jobs e Polling (`wait_ms >= 60s`), Higiene de Ambiente e Ferramentas Nativas (`NVM manual = 0`), Economia de Contexto e Batching, e Latência Nativa Local (`p50`/`p95` + telemetria de hits dos Caches Zero-Stale).
    - **Tabela por Ferramenta e Diagnóstico de Erros/Anti-Padrões**: detalha volume, taxas de erro, latências `p50/p95`, payload médio e assinaturas residuais.

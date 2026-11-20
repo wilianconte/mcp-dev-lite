@@ -1,13 +1,15 @@
 import { appendFile, chmod, mkdir, rename, stat } from "node:fs/promises";
 import path from "node:path";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import { MCP_SERVER_VERSION } from "./version.js";
+
+export { MCP_SERVER_VERSION } from "./version.js";
 
 const SENSITIVE_KEY = /(authorization|password|passwd|token|secret|api[_-]?key|credential|cookie)/i;
 const MAX_STRING_CHARS = 2_000;
 const MAX_ARRAY_ITEMS = 50;
 const MAX_OBJECT_KEYS = 100;
 const DEFAULT_MAX_AUDIT_FILE_BYTES = 20 * 1024 * 1024;
-export const MCP_SERVER_VERSION = "1.5.0";
 
 function redactSecretsInString(value: string): string {
   return value
@@ -54,6 +56,7 @@ export function sanitizeAuditValue(value: unknown, key = ""): unknown {
 
 export interface ToolResultSummary {
   is_error: boolean;
+  outcome: ToolOutcome;
   content_types: string[];
   text_chars: number;
   image_base64_chars: number;
@@ -65,6 +68,15 @@ export interface ToolResultSummary {
   timed_out?: boolean;
   preview?: string;
 }
+
+export type ToolOutcome =
+  | "success"
+  | "tool_error"
+  | "command_nonzero_exit"
+  | "timeout"
+  | "killed"
+  | "output_limit"
+  | "running";
 
 export function summarizeToolResult(result: CallToolResult, includePreview = false): ToolResultSummary {
   let textChars = 0;
@@ -125,8 +137,22 @@ export function summarizeToolResult(result: CallToolResult, includePreview = fal
     }
     if (item.type === "image") imageBase64Chars += item.data.length;
   }
+  const outcome: ToolOutcome = result.isError === true
+    ? "tool_error"
+    : timedOut || exitCode === "timeout"
+      ? "timeout"
+      : exitCode === "killed" || jobStatus === "killed"
+        ? "killed"
+        : exitCode === "output_limit" || jobStatus === "output_limit"
+          ? "output_limit"
+          : typeof exitCode === "number" && exitCode !== 0
+            ? "command_nonzero_exit"
+            : jobStatus === "running" || exitCode === "running"
+              ? "running"
+              : "success";
   const summary: ToolResultSummary = {
     is_error: result.isError === true,
+    outcome,
     content_types: contentTypes,
     text_chars: textChars,
     image_base64_chars: imageBase64Chars,
@@ -166,7 +192,7 @@ export function auditLogPath(): string | null {
   if (dataDir) {
     return path.join(path.resolve(dataDir), "audit.jsonl");
   }
-  return null;
+  return path.resolve(process.cwd(), "data", "audit.jsonl");
 }
 
 function shouldWriteStderr(): boolean {
@@ -176,6 +202,67 @@ function shouldWriteStderr(): boolean {
 // Cache de caminhos já preparados (mkdir 0700 + chmod 0600) e tamanho estimado em bytes para rotacao sem stat extra por chamada.
 const preparedAuditPaths = new Set<string>();
 const auditFileSizes = new Map<string, number>();
+const auditWriteQueues = new Map<string, Promise<void>>();
+
+export interface AuditWriteStats {
+  writes: number;
+  failures: number;
+  totalWriteMs: number;
+  lastWriteMs: number;
+  lastError?: string;
+}
+
+const auditWriteStats: AuditWriteStats = {
+  writes: 0,
+  failures: 0,
+  totalWriteMs: 0,
+  lastWriteMs: 0,
+};
+
+export function getAuditWriteStats(): AuditWriteStats {
+  return { ...auditWriteStats };
+}
+
+async function appendAuditLine(target: string, line: string): Promise<void> {
+  const startedAtMs = Date.now();
+  try {
+    const lineBytes = Buffer.byteLength(line, "utf8") + 1;
+    const maxAuditBytes = Number(process.env.MCP_AUDIT_MAX_BYTES ?? DEFAULT_MAX_AUDIT_FILE_BYTES);
+
+    if (!preparedAuditPaths.has(target)) {
+      await mkdir(path.dirname(target), { recursive: true, mode: 0o700 });
+      await chmod(path.dirname(target), 0o700);
+      const existingStat = await stat(target).catch(() => null);
+      auditFileSizes.set(target, existingStat?.size ?? 0);
+      preparedAuditPaths.add(target);
+    }
+
+    let currentBytes = auditFileSizes.get(target) ?? 0;
+    if (Number.isFinite(maxAuditBytes) && maxAuditBytes > 0 && currentBytes > 0 && currentBytes + lineBytes > maxAuditBytes) {
+      await rename(target, `${target}.1`).catch(() => undefined);
+      await chmod(`${target}.1`, 0o600).catch(() => undefined);
+      currentBytes = 0;
+    }
+
+    await appendFile(target, `${line}\n`, { encoding: "utf8", mode: 0o600 });
+    if (currentBytes === 0) {
+      await chmod(target, 0o600);
+    }
+    auditFileSizes.set(target, currentBytes + lineBytes);
+    auditWriteStats.writes += 1;
+    auditWriteStats.lastWriteMs = Math.max(0, Date.now() - startedAtMs);
+    auditWriteStats.totalWriteMs += auditWriteStats.lastWriteMs;
+  } catch (err) {
+    preparedAuditPaths.delete(target);
+    auditFileSizes.delete(target);
+    const message = err instanceof Error ? err.message : String(err);
+    auditWriteStats.failures += 1;
+    auditWriteStats.lastWriteMs = Math.max(0, Date.now() - startedAtMs);
+    auditWriteStats.totalWriteMs += auditWriteStats.lastWriteMs;
+    auditWriteStats.lastError = message;
+    console.error(`[audit] falha ao gravar ${target}: ${message}`);
+  }
+}
 
 export async function auditToolCall(event: ToolAuditEvent): Promise<void> {
   const finishedAtMs = Date.now();
@@ -201,32 +288,12 @@ export async function auditToolCall(event: ToolAuditEvent): Promise<void> {
 
   const target = auditLogPath();
   if (!target) return;
+  const previous = auditWriteQueues.get(target) ?? Promise.resolve();
+  const current = previous.then(() => appendAuditLine(target, line));
+  auditWriteQueues.set(target, current);
   try {
-    const lineBytes = Buffer.byteLength(line, "utf8") + 1;
-    const maxAuditBytes = Number(process.env.MCP_AUDIT_MAX_BYTES ?? DEFAULT_MAX_AUDIT_FILE_BYTES);
-
-    if (!preparedAuditPaths.has(target)) {
-      await mkdir(path.dirname(target), { recursive: true, mode: 0o700 });
-      const existingStat = await stat(target).catch(() => null);
-      auditFileSizes.set(target, existingStat?.size ?? 0);
-      preparedAuditPaths.add(target);
-    }
-
-    let currentBytes = auditFileSizes.get(target) ?? 0;
-    if (Number.isFinite(maxAuditBytes) && maxAuditBytes > 0 && currentBytes > 0 && currentBytes + lineBytes > maxAuditBytes) {
-      await rename(target, `${target}.1`).catch(() => undefined);
-      currentBytes = 0;
-    }
-
-    await appendFile(target, `${line}\n`, { encoding: "utf8", mode: 0o600 });
-    if (currentBytes === 0) {
-      await chmod(target, 0o600).catch(() => undefined);
-    }
-    auditFileSizes.set(target, currentBytes + lineBytes);
-  } catch (err) {
-    preparedAuditPaths.delete(target);
-    auditFileSizes.delete(target);
-    const message = err instanceof Error ? err.message : String(err);
-    console.error(`[audit] falha ao gravar ${target}: ${message}`);
+    await current;
+  } finally {
+    if (auditWriteQueues.get(target) === current) auditWriteQueues.delete(target);
   }
 }
